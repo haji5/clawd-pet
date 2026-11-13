@@ -108,6 +108,7 @@ impl Tray {
     /// Tooltip text, max 127 UTF-16 units (longer text is cut).
     pub fn set_tip(&mut self, tip: &str) {
         if self.tip != tip {
+            crate::dlog!("tray tip sent");
             self.tip = tip.into();
             unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.data(NIF_TIP)) };
         }

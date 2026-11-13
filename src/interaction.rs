@@ -271,8 +271,14 @@ pub fn gaze_toward(dx: f64, dy: f64, radius: f64) -> Option<(i32, i32)> {
 }
 
 /// How long the eyes can go without looking: a cursor `distance` DIP away
-/// can't get within their range any sooner, even at full speed.
-pub fn cursor_poll_ms(distance: f64) -> u32 {
+/// can't get within their range any sooner, even at full speed. One that
+/// has sat still (relative to Clawd) for `still_ms` is looked at slowly
+/// wherever it is: the eyes then catch up at most `CURSOR_POLL_SLOW_MS`
+/// after it starts moving (user decision, performance audit 2026-11-13).
+pub fn cursor_poll_ms(distance: f64, still_ms: Ms) -> u32 {
+    if still_ms >= CURSOR_STILL_MS {
+        return CURSOR_POLL_SLOW_MS;
+    }
     let ms = (distance - EYES_RADIUS_DIP) / CURSOR_MAX_DIP_PER_S * 1000.0;
     (ms as u32).clamp(CURSOR_POLL_MS, CURSOR_POLL_SLOW_MS)
 }
@@ -283,10 +289,17 @@ mod tests {
 
     #[test]
     fn polling_slows_down_only_when_the_cursor_cannot_arrive_sooner() {
-        assert_eq!(cursor_poll_ms(0.0), CURSOR_POLL_MS);
-        assert_eq!(cursor_poll_ms(EYES_RADIUS_DIP + 100.0), CURSOR_POLL_MS, "just outside the range");
-        assert_eq!(cursor_poll_ms(EYES_RADIUS_DIP + 600.0), 100);
-        assert_eq!(cursor_poll_ms(10_000.0), CURSOR_POLL_SLOW_MS);
+        assert_eq!(cursor_poll_ms(0.0, 0), CURSOR_POLL_MS);
+        assert_eq!(cursor_poll_ms(EYES_RADIUS_DIP + 100.0, 0), CURSOR_POLL_MS, "just outside the range");
+        assert_eq!(cursor_poll_ms(EYES_RADIUS_DIP + 600.0, 0), 100);
+        assert_eq!(cursor_poll_ms(10_000.0, 0), CURSOR_POLL_SLOW_MS);
+    }
+
+    #[test]
+    fn polling_slows_down_once_the_cursor_rests() {
+        assert_eq!(cursor_poll_ms(0.0, CURSOR_STILL_MS - 1), CURSOR_POLL_MS, "still moving recently");
+        assert_eq!(cursor_poll_ms(0.0, CURSOR_STILL_MS), CURSOR_POLL_SLOW_MS, "resting right next to Clawd");
+        assert_eq!(cursor_poll_ms(10_000.0, CURSOR_STILL_MS), CURSOR_POLL_SLOW_MS);
     }
 
     #[test]

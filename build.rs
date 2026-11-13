@@ -11,7 +11,7 @@ const RT_MANIFEST: u16 = 24;
 const LANG_EN_US: u16 = 0x0409;
 const ICO: &str = "assets/clawd.ico";
 const MANIFEST: &str = "assets/clawd.manifest";
-const DELAY_LOADED: &[&str] = &["user32.dll", "gdi32.dll", "shell32.dll", "dwmapi.dll", "advapi32.dll", "imm32.dll", "api-ms-win-shcore-scaling-l1-1-1.dll"];
+const DELAY_LOADED: &[&str] = &["user32.dll", "gdi32.dll", "shell32.dll", "dwmapi.dll", "advapi32.dll", "imm32.dll", "api-ms-win-shcore-scaling-l1-1-1.dll", "bcryptprimitives.dll"];
 
 /// One resource: a 32-byte header with numeric type and id, then the data,
 /// padded to a 4-byte boundary.
@@ -73,6 +73,9 @@ fn main() {
     // The hook starts once per Claude event and needs none of these, and
     // load-time imports cost every run (user32 alone: 2.8 ms of a 9 ms hook,
     // see ROADMAP Phase 6). The pet still loads them, on first use.
+    // `bcryptprimitives` is std's random seed for `HashMap`: the hook has no
+    // `HashMap` on its path any more, and the config read on `SessionStart`
+    // and the pet load it when they need it.
     for dll in DELAY_LOADED {
         println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
     }

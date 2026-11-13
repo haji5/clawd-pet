@@ -48,6 +48,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Power::{
+    HPOWERNOTIFY, POWERBROADCAST_SETTING, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
+};
+use windows_sys::core::GUID;
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
 use windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows_sys::Win32::UI::Controls::{NMTTDISPINFOW, TTN_GETDISPINFOW};
@@ -68,6 +72,14 @@ const WM_APP_EVENT: u32 = 0x8000 + 2; // WM_APP + 2: IPC queue has messages
 /// Never posted: put in `LATER` when a WinEvent arrived while the state was
 /// in use, to look at the foreground and the perch window again afterwards.
 const WM_APP_RECHECK: u32 = 0x8000 + 3;
+/// Never posted: a `WM_POWERBROADCAST` about the display, read in `wndproc`
+/// (wParam 1 = on, 0 = off).
+const WM_APP_DISPLAY: u32 = 0x8000 + 4;
+/// windows-sys has it in `SystemServices`, a large feature for one GUID.
+const GUID_CONSOLE_DISPLAY_STATE: GUID = GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+/// After the cursor was last over the tray icon, its tooltip text is kept
+/// current this long (the tooltip can stay up with the cursor resting).
+const TRAY_HOVER_MS: Ms = 10_000;
 const TIMER_SAVE: usize = 1;
 /// One-shot: the next frame or state change (tracker + animator).
 const TIMER_TICK: usize = 2;
@@ -389,7 +401,16 @@ struct App {
     cursor_timer: bool,
     /// The cursor timer's current period.
     cursor_wait: u32,
+    /// The cursor's offset from the eyes at the last poll, and when that
+    /// last changed (never stored anywhere else, never logged).
+    cursor_seen: ((f64, f64), Ms),
     tray: Option<Tray>,
+    /// The tray icon was hovered recently: its tooltip text is kept current
+    /// until then (otherwise it only goes to Explorer on hover).
+    tray_hover_until: Option<Ms>,
+    /// The display is off (`GUID_CONSOLE_DISPLAY_STATE`): no frames.
+    display_off: bool,
+    power_notify: HPOWERNOTIFY,
     /// `TIMER_PULSE` is running.
     pulsing: bool,
     /// Claude needs the user; lifts the window in `attentionOnly` mode.
@@ -507,7 +528,7 @@ fn handle_later(msg: u32, wp: WPARAM, lp: LPARAM) {
     }
     let keep = match msg {
         // Their lParam is a plain number.
-        WM_APP_EVENT | WM_APP_RECHECK | WM_APP_TRAY | WM_ENDSESSION | WM_DESTROY => (msg, wp, lp),
+        WM_APP_EVENT | WM_APP_RECHECK | WM_APP_TRAY | WM_APP_DISPLAY | WM_ENDSESSION | WM_DESTROY => (msg, wp, lp),
         // Their lParam points at something that won't be there later, and
         // the handlers only read wParam.
         WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => (msg, wp, 0),
@@ -515,6 +536,10 @@ fn handle_later(msg: u32, wp: WPARAM, lp: LPARAM) {
         _ => return,
     };
     let mut later = LATER.lock().unwrap_or_else(|e| e.into_inner());
+    if msg == WM_APP_DISPLAY {
+        // Only the latest state counts (off, on, off must end up off).
+        later.retain(|m| m.0 != WM_APP_DISPLAY);
+    }
     if !later.contains(&keep) {
         later.push(keep);
     }
@@ -967,7 +992,7 @@ impl App {
         let busy = self.hand.pressed()
             || self.flying()
             || self.hang().is_some()
-            || !self.presence.up()
+            || !self.animating()
             || self.demo
             || self.peek.is_some()
             || matches!(self.director.mode(), Mode::Asleep);
@@ -1232,6 +1257,16 @@ impl App {
                 self.check_fullscreen();
                 continue;
             }
+            if m.e == "__display" && crate::debug::enabled() {
+                // `--tool 0`: the display went off, `1`: back on.
+                self.set_display_off(m.t.as_deref() == Some("0"));
+                continue;
+            }
+            if m.e == "__trayhover" && crate::debug::enabled() {
+                // The cursor over the tray icon, without a cursor.
+                self.on_tray_hover();
+                continue;
+            }
             if m.e == "__clock" && crate::debug::enabled() {
                 self.clock_override = m.t.as_deref().and_then(Clock::parse);
                 self.apply_mood();
@@ -1366,6 +1401,7 @@ impl App {
             && self.cfg.position.on_taskbar
             && !self.demo
             && (self.presence.up() || crate::debug::enabled())
+            && !self.display_off
             && matches!(self.motion, Motion::Standing | Motion::Strolling(_))
             && self.hop.is_none()
             && self.peek.is_none()
@@ -1453,6 +1489,46 @@ impl App {
         }
     }
 
+    /// Frames are worth drawing: the window is up and the display is on.
+    fn animating(&self) -> bool {
+        self.presence.up() && !self.display_off
+    }
+
+    /// Send the tray icon's tooltip to Explorer if it changed. Only around
+    /// a hover (`tray_hover_until`): Explorer took ~0.55 ms of CPU per push,
+    /// and the text changes on nearly every Claude event (performance audit,
+    /// 2026-11-13). Someone reaching the icon by keyboard sees the text from
+    /// the last hover.
+    fn update_tray_tip(&mut self) {
+        let mut tip = if self.demo { format!("Demo: {}", self.anim_name) } else { self.tracker.tooltip() };
+        if let Some(e) = self.art.as_ref().and_then(|a| a.error.as_ref()) {
+            tip = format!("{e}\n{tip}");
+        }
+        if let Some(e) = &self.port_error {
+            tip = format!("{e}\n{tip}");
+        }
+        if let Some(t) = self.tray.as_mut() {
+            t.set_tip(&tip);
+        }
+    }
+
+    /// The cursor is over the tray icon: its tooltip is about to show.
+    fn on_tray_hover(&mut self) {
+        self.tray_hover_until = Some(self.now() + TRAY_HOVER_MS);
+        self.update_tray_tip();
+    }
+
+    /// The display went off or came back on. Off counts as hidden for the
+    /// frame and cursor timers: nobody can see them (performance audit,
+    /// 2026-11-13). The window itself stays where it is.
+    fn set_display_off(&mut self, off: bool) {
+        if off != self.display_off {
+            crate::dlog!("display {}", if off { "off" } else { "on" });
+            self.display_off = off;
+            self.refresh();
+        }
+    }
+
     /// Recompute what Clawd shows, redraw if the picture changed, and arm
     /// the one-shot timer for the next change.
     fn refresh(&mut self) {
@@ -1494,22 +1570,14 @@ impl App {
         self.redraw(false);
         self.ring_if_needed(d.mode, now);
         self.set_attention(matches!(d.mode, Mode::Attention(_)));
-        self.set_tray_pulse(d.mode == Mode::Attention(Attention::Impatient) && !self.fullscreen);
-
-        let mut tip = if self.demo { format!("Demo: {}", self.anim_name) } else { self.tracker.tooltip() };
-        if let Some(e) = self.art.as_ref().and_then(|a| a.error.as_ref()) {
-            tip = format!("{e}\n{tip}");
-        }
-        if let Some(e) = &self.port_error {
-            tip = format!("{e}\n{tip}");
-        }
-        if let Some(t) = self.tray.as_mut() {
-            t.set_tip(&tip);
+        self.set_tray_pulse(d.mode == Mode::Attention(Attention::Impatient) && !self.fullscreen && !self.display_off);
+        if self.tray_hover_until.is_some_and(|t| now < t) {
+            self.update_tray_tip();
         }
 
         let next = [
             self.tracker.next_change(now),
-            self.director.next_change(&self.sheet, now, self.presence.up()),
+            self.director.next_change(&self.sheet, now, self.animating()),
             self.grumpy_at,
             self.hover_off_at,
             self.hop.map(Hop::at),
@@ -1938,7 +2006,7 @@ impl App {
     /// "eyes follow cursor" on). No global mouse hook; positions are never
     /// stored or logged.
     fn update_cursor_timer(&mut self) {
-        let want = self.presence.up()
+        let want = self.animating()
             && self.cfg.behaviours.eyes_follow_cursor
             && !self.demo
             && !matches!(self.director.mode(), Mode::Asleep);
@@ -1947,6 +2015,7 @@ impl App {
             unsafe {
                 if want {
                     self.cursor_wait = feel::CURSOR_POLL_MS;
+                    self.cursor_seen = ((f64::NAN, f64::NAN), self.now());
                     SetTimer(self.hwnd, TIMER_CURSOR, self.cursor_wait, None);
                 } else {
                     KillTimer(self.hwnd, TIMER_CURSOR);
@@ -1959,17 +2028,24 @@ impl App {
     }
 
     fn on_cursor_timer(&mut self) {
+        let now = self.now();
         let (cx, cy) = self.cursor();
         let ex = (self.pos.0 + crate::compose::FEET.0 * self.px) as f64;
         let ey = (self.pos.1 + EYES_Y * self.px) as f64;
         let scale = self.scale();
-        let g = interaction::gaze_toward(cx - ex, cy - ey, feel::EYES_RADIUS_DIP * scale);
+        let (dx, dy) = (cx - ex, cy - ey);
+        let g = interaction::gaze_toward(dx, dy, feel::EYES_RADIUS_DIP * scale);
         if g != self.director.gaze() {
             self.director.set_gaze(g);
             self.redraw(false);
         }
-        // A far-away cursor can't reach the eyes' range before the next look.
-        let wait = interaction::cursor_poll_ms((cx - ex).hypot(cy - ey) / scale);
+        // Relative to Clawd: a walk or a ride moves the eyes' target too.
+        if (dx, dy) != self.cursor_seen.0 {
+            self.cursor_seen = ((dx, dy), now);
+        }
+        // A far-away cursor can't reach the eyes' range before the next
+        // look, and a resting one is looked at less often.
+        let wait = interaction::cursor_poll_ms(dx.hypot(dy) / scale, now - self.cursor_seen.1);
         if wait.abs_diff(self.cursor_wait) >= feel::CURSOR_REARM_STEP_MS {
             self.cursor_wait = wait;
             unsafe { SetTimer(self.hwnd, TIMER_CURSOR, wait, None) };
@@ -2208,6 +2284,10 @@ impl App {
 
     fn on_destroy(&mut self) {
         self.save_now();
+        if self.power_notify != 0 {
+            unsafe { UnregisterPowerSettingNotification(self.power_notify) };
+            self.power_notify = 0;
+        }
         self.tray = None; // removes the icon
         unsafe { PostQuitMessage(0) };
     }
@@ -2250,8 +2330,10 @@ impl App {
                 WM_RBUTTONUP | WM_CONTEXTMENU => self.after.push(After::Menu),
                 WM_LBUTTONUP if !self.visible => self.set_visible(true),
                 WM_LBUTTONUP => self.go_to_waiting(),
+                WM_MOUSEMOVE => self.on_tray_hover(),
                 _ => {}
             },
+            WM_APP_DISPLAY => self.set_display_off(wp == 0),
             WM_APP_EVENT => self.on_ipc(),
             WM_APP_RECHECK => self.recheck_windows(),
             WM_TIMER if wp == TIMER_SAVE => self.save_now(),
@@ -2341,7 +2423,42 @@ unsafe extern "system" fn on_win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND,
     }
 }
 
+/// What a `WM_POWERBROADCAST` says about the display: `Some(true)` when it
+/// is on (or dimmed), `Some(false)` when off, `None` for anything else.
+///
+/// # Safety
+/// `lp` must be the message's lParam, which for `PBT_POWERSETTINGCHANGE`
+/// points at a `POWERBROADCAST_SETTING`.
+unsafe fn display_on(wp: WPARAM, lp: LPARAM) -> Option<bool> {
+    if wp != PBT_POWERSETTINGCHANGE as WPARAM || lp == 0 {
+        return None;
+    }
+    let s = lp as *const POWERBROADCAST_SETTING;
+    let display = |g: GUID| {
+        let d = GUID_CONSOLE_DISPLAY_STATE;
+        (g.data1, g.data2, g.data3, g.data4) == (d.data1, d.data2, d.data3, d.data4)
+    };
+    unsafe {
+        if !display((*s).PowerSetting) || ((*s).DataLength as usize) < size_of::<u32>() {
+            return None;
+        }
+        // 0 off, 1 on, 2 dimmed.
+        Some(std::ptr::addr_of!((*s).Data).cast::<u32>().read_unaligned() != 0)
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // Its lParam is gone once this returns: read it now, and go on as a
+    // plain `WM_APP_DISPLAY` that can wait in `LATER` if it has to.
+    if msg == WM_POWERBROADCAST {
+        if let Some(on) = unsafe { display_on(wp, lp) } {
+            let wp = on as WPARAM;
+            if enter(|a| a.on_message(hwnd, WM_APP_DISPLAY, wp, 0)).is_none() {
+                handle_later(WM_APP_DISPLAY, wp, 0);
+            }
+        }
+        return 1; // TRUE
+    }
     match enter(|a| a.on_message(hwnd, msg, wp, lp)) {
         Some(Some(answer)) => answer,
         Some(None) => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
@@ -2469,7 +2586,11 @@ pub fn run(opts: Options) {
             grumpy_at: None,
             cursor_timer: false,
             cursor_wait: feel::CURSOR_POLL_MS,
+            cursor_seen: ((f64::NAN, f64::NAN), 0),
             tray: None,
+            tray_hover_until: None,
+            display_off: false,
+            power_notify: 0,
             pulsing: false,
             attention: false,
             goto_jumps: Vec::new(),
@@ -2525,6 +2646,12 @@ pub fn run(opts: Options) {
             a.redraw(true);
             // Before showing anything: launched during a game, it must not flash.
             a.fg_hooks = Some(foreground::foreground(Some(on_win_event)));
+            // Display off/on. Windows answers at once with the current state;
+            // that arrives nested in here and waits in `LATER`.
+            a.power_notify = RegisterPowerSettingNotification(hwnd, &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE);
+            if a.power_notify == 0 {
+                crate::dlog!("RegisterPowerSettingNotification failed: {}", std::io::Error::last_os_error());
+            }
             a.on_foreground(windows::foreground());
             a.set_visible(!hidden);
             // Tray icon: a small 16-px Clawd drawn for it (the 2x body doesn't

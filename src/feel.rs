@@ -153,8 +153,11 @@ pub const PEEK_SIZE: u32 = 1;
 pub const EYES_RADIUS_DIP: f64 = 250.0;
 /// Cursor polling while awake and visible (15 Hz).
 pub const CURSOR_POLL_MS: u32 = 66;
-/// With the cursor far away, polling slows down to this at most.
+/// With the cursor far away, or resting, polling slows down to this at most.
 pub const CURSOR_POLL_SLOW_MS: u32 = 264;
+/// A cursor that hasn't moved relative to Clawd for this long is resting:
+/// polled at `CURSOR_POLL_SLOW_MS` until it moves again.
+pub const CURSOR_STILL_MS: Ms = 1500;
 /// Fast enough that a real flick doesn't beat the next poll to the eyes.
 pub const CURSOR_MAX_DIP_PER_S: f64 = 6000.0;
 /// The poll timer is re-armed only when the wait changes by this much.
