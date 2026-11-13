@@ -1,0 +1,12 @@
+/target
+*.clawd-backup-*
+
+# Editors and OS
+.idea/
+.vscode/
+*.iml
+Thumbs.db
+Desktop.ini
+
+# Images exported while reviewing art
+*.bmp

@@ -1,0 +1,22 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000004",
+  "transcript_path": "C:\\Users\\dev\\.claude\\projects\\C--Users-dev-code-my-app\\session.jsonl",
+  "cwd": "C:\\Users\\dev\\code\\my-app",
+  "scratchpad_dir": "C:\\Users\\dev\\AppData\\Local\\Temp\\claude\\scratchpad",
+  "prompt_id": "11111111-1111-4111-8111-111111111111",
+  "permission_mode": "auto",
+  "agent_id": "a0123456789abcdef",
+  "agent_type": "general-purpose",
+  "effort": {
+    "level": "low"
+  },
+  "hook_event_name": "PermissionDenied",
+  "tool_name": "mcp__ccd_session__hand_off_to_session",
+  "tool_input": {},
+  "tool_use_id": "toolu_01EXAMPLE",
+  "reason": "Denied by the auto mode classifier.",
+  "mcp_server": {
+    "name": "ccd_session",
+    "source": "sdk"
+  }
+}

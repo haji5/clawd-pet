@@ -1,0 +1,13 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000002",
+  "transcript_path": "C:\\Users\\dev\\.claude\\projects\\C--Users-dev-code-my-app\\session.jsonl",
+  "cwd": "C:\\Users\\dev\\code\\my-app",
+  "scratchpad_dir": "C:\\Users\\dev\\AppData\\Local\\Temp\\claude\\scratchpad",
+  "hook_event_name": "SessionStart",
+  "source": "resume",
+  "session_title": "Example session",
+  "seconds_since_last_response": 687,
+  "context_tokens": 127214,
+  "prompt_cache_likely_expired": false,
+  "estimated_cache_write_usd": 1.0177
+}

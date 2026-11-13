@@ -1,0 +1,22 @@
+// Clawd palette. One entry per line: <char> <#RRGGBB | transparent> <description>
+// New colours go here; sprites may only use characters defined in this file.
+.  transparent
+O  #D97757   body orange
+L  #EBA287   body highlight
+D  #B5583A   body shadow / legs
+K  #1E1714   ink (eyes, outlines)
+W  #FFFFFF   bubble fill, eye shine
+H  #E5484D   heart red
+G  #46A758   success green
+B  #6E8BC9   screen/tool blue
+Y  #F2C94C   sparkle yellow
+S  #8A8F98   metal grey (tools)
+h  #F7C6B0   body specular (top-left)
+E  #8E4028   body deep shadow / legs
+R  #5A2416   body outline (rust)
+P  #EE8E7A   blush
+N  #22304F   terminal screen
+s  #5D6168   metal shadow (tools)
+g  #D5DAE1   bubble / glass shade
+u  #E3D5C8   dust light
+U  #B9A898   dust shade

@@ -1,0 +1,35 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\me\\AppData\\Local\\clawd-pet\\dev\\clawd-pet.exe",
+            "args": [
+              "--hook"
+            ],
+            "async": true,
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\me\\AppData\\Local\\clawd-pet\\dev\\clawd-pet.exe",
+            "args": [
+              "--hook"
+            ],
+            "async": true,
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

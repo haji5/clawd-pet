@@ -1,0 +1,18 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000003",
+  "transcript_path": "C:\\Users\\dev\\.claude\\projects\\C--Users-dev-code-my-app\\session.jsonl",
+  "cwd": "C:\\Users\\dev\\code\\my-app",
+  "scratchpad_dir": "C:\\Users\\dev\\AppData\\Local\\Temp\\claude\\scratchpad",
+  "prompt_id": "11111111-1111-4111-8111-111111111111",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "ls /nonexistent",
+    "description": "example"
+  },
+  "tool_use_id": "toolu_01EXAMPLE"
+}

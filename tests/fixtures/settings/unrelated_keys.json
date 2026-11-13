@@ -1,0 +1,21 @@
+{
+  "theme": "dark",
+  "model": "opus",
+  "permissions": {
+    "allow": [
+      "Bash(git status)"
+    ],
+    "deny": []
+  },
+  "enabledPlugins": {
+    "zeta@market": true,
+    "alpha@market": false
+  },
+  "unknownFutureKey": {
+    "nested": [
+      1,
+      2.5,
+      "é"
+    ]
+  }
+}
