@@ -22,7 +22,7 @@ A tiny pixel desktop pet for Windows that reacts to what [Claude Code](https://c
 
 ## Install
 
-1. Download `clawd-pet.exe` from the [latest release](https://github.com/haji5/clawd-pet/releases/latest). It's a single ~750 KB file with no installer and no runtime.
+1. Download `clawd-pet.exe` from the [latest release](https://github.com/haji5/clawd-pet/releases/latest). It's a single ~800 KB file with no installer and no runtime.
 2. Run it. Clawd appears above the taskbar in the bottom-right corner with an icon in the system tray.
    *Windows SmartScreen may warn about an unrecognised app because the exe isn't code-signed. Choose "More info" → "Run anyway", or build it yourself (see below).*
 3. Right-click Clawd or its tray icon and choose **Install Claude hooks**.
@@ -31,6 +31,12 @@ A tiny pixel desktop pet for Windows that reacts to what [Claude Code](https://c
 "Install Claude hooks" copies the exe to `%LOCALAPPDATA%\clawd-pet\`, so you can delete the download afterwards. It adds Clawd's entries to `~/.claude/settings.json` and keeps a backup of the file first. Your other settings and hooks are left as they are.
 
 By default, **Launch with Claude** is on: whenever a Claude Code session starts, it starts Clawd if it isn't running. Turn on **Start with Windows** in the menu if you want Clawd around all the time.
+
+### Updating
+
+Right-click Clawd → **Check for updates…**. Clawd asks GitHub for the latest release and, if it's newer, asks before installing it. On **Yes** it downloads the new exe, checks it against the release's SHA-256, replaces itself in place and restarts. The copy in `%LOCALAPPDATA%\clawd-pet\` and Clawd's hooks in `settings.json` (if you installed them) are brought up to date too, and nothing is left behind to tidy up. Clawd never checks for updates by itself.
+
+The checksum catches a broken or wrong download. It doesn't prove who built the exe, since it comes from the same release; the HTTPS connection to GitHub is what vouches for the source. The exe isn't code-signed.
 
 ### Uninstall
 
@@ -50,7 +56,7 @@ clawd-pet.exe --uninstall-hooks
 
 ## Privacy and cost
 
-- **No tokens, no network.** Clawd never calls an API or runs a model, and it never changes what Claude does. Its only network traffic is a UDP packet on `127.0.0.1`.
+- **No tokens, and no network unless you ask.** Clawd never runs a model or calls Anthropic, and it never changes what Claude does. Its only traffic is a UDP packet on `127.0.0.1`, except when you choose **Check for updates…**: then the pet (never the hook) asks GitHub for the latest release and, if you say yes, downloads it. GitHub sees your IP address and Clawd's version (in the `User-Agent`), and nothing else; nothing about your Claude sessions is sent.
 - **The hook is silent.** Claude Code runs `clawd-pet.exe --hook` asynchronously on each event. It prints nothing (hook output could end up in Claude's context) and always exits 0, so it can never block or alter an action. If Clawd isn't running, the packet is simply dropped.
 - **Minimal data.** The hook forwards only the event name, tool name, session id, the project folder's name, subagent ids and, for shell commands, a one-word class (`git`, `test`, `build` or `install`). It never forwards the command itself, your prompts, file contents, tool inputs or transcripts. For "Go to the session", it also sends the session's parent process id and the desktop app's chat name. All of it stays in the pet's memory.
 
@@ -76,7 +82,7 @@ The menu (right-click Clawd or the tray icon) has:
 - **Show / Hide**, **Size** (1×–6×), **Placement** (always on top, or on top only when Claude needs you), **Back to taskbar spot**
 - **Behaviours**: perch on windows, follow the active window, eyes follow cursor, walk around, hide during fullscreen apps, show attention during fullscreen, time-of-day moods, sound when Claude needs you, hide and quit with the Claude app
 - **Do not disturb**: naps through everything except permission prompts and questions
-- **Launch with Claude**, **Start with Windows**, **Install / Uninstall Claude hooks**, **Quit**
+- **Launch with Claude**, **Start with Windows**, **Install / Uninstall Claude hooks**, **Check for updates…**, **Quit**
 
 ### Settings file
 
@@ -96,7 +102,7 @@ Measured on an i7-13700H (20 logical CPUs) with `scripts/perf.ps1`. CPU is a per
 
 | | Measured |
 |---|---|
-| Executable | ~750 KB, one file |
+| Executable | ~800 KB, one file |
 | Memory | 0.5–1.9 MB private (the working set is trimmed whenever Clawd rests) |
 | CPU asleep or hidden | ~0 % (no timers run) |
 | CPU awake and idle, eyes following the cursor | 0.011 % |
@@ -115,7 +121,7 @@ Needs [Rust](https://rustup.rs/) 1.85 or newer (edition 2024) with the MSVC tool
 cargo build --release
 ```
 
-The exe is `target\release\clawd-pet.exe`. Hooks run the installed copy in `%LOCALAPPDATA%\clawd-pet\`, so after rebuilding, choose **Install Claude hooks** from the new exe to update it.
+The exe is `target\release\clawd-pet.exe`. Hooks run the installed copy in `%LOCALAPPDATA%\clawd-pet\`, so after rebuilding, choose **Install Claude hooks** from the new exe to update it. (A release from GitHub does this by itself through **Check for updates…**.)
 
 ```bash
 cargo test

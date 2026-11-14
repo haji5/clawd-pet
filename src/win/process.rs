@@ -11,6 +11,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOTOWNER, GetAncestor, IsWindowVisible, SW_SHOWNORMAL};
@@ -73,6 +74,18 @@ pub fn created(pid: u32) -> Option<u64> {
         let ok = running && GetProcessTimes(h, &mut start, &mut exit, &mut kernel, &mut user) != 0;
         CloseHandle(h);
         ok.then_some((start.dwHighDateTime as u64) << 32 | start.dwLowDateTime as u64)
+    }
+}
+
+/// Wait up to `ms` for process `pid` to end. A pid that can't be opened
+/// has already gone (or isn't ours to wait for).
+pub fn wait_for_exit(pid: u32, ms: u32) {
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if !h.is_null() {
+            WaitForSingleObject(h, ms);
+            CloseHandle(h);
+        }
     }
 }
 
@@ -146,5 +159,18 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(created(pid), None);
         drop(child);
+    }
+
+    #[test]
+    fn waits_for_a_process_to_end_and_not_for_one_that_has() {
+        let mut child = std::process::Command::new("cmd").args(["/c", "ping -n 2 127.0.0.1 >nul"]).spawn().unwrap();
+        let t = std::time::Instant::now();
+        wait_for_exit(child.id(), 10_000);
+        assert!(child.try_wait().unwrap().is_some(), "it has ended");
+        assert!(t.elapsed().as_secs() < 9);
+        let t = std::time::Instant::now();
+        wait_for_exit(child.id(), 10_000); // ended, handle still held: signalled at once
+        wait_for_exit(u32::MAX - 3, 10_000); // no such process
+        assert!(t.elapsed().as_millis() < 1000);
     }
 }

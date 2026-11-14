@@ -16,6 +16,7 @@
 use super::autostart;
 use super::chime;
 use super::foreground::{self, Hooks};
+use super::http;
 use super::launch;
 use super::monitor::{self, Monitor};
 use super::process::{self, Finder};
@@ -41,12 +42,13 @@ use crate::rng::Rng;
 use crate::sound;
 use crate::sprite::{self, Sheet};
 use crate::tracker::{Attention, Mode, Ms, Tracker};
+use crate::update::{self, Verdict, Version};
 use crate::walk::Stroll;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Power::{
     HPOWERNOTIFY, POWERBROADCAST_SETTING, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
@@ -75,6 +77,8 @@ const WM_APP_RECHECK: u32 = 0x8000 + 3;
 /// Never posted: a `WM_POWERBROADCAST` about the display, read in `wndproc`
 /// (wParam 1 = on, 0 = off).
 const WM_APP_DISPLAY: u32 = 0x8000 + 4;
+/// Posted by an update worker: its news is in `Updater::news`.
+const WM_APP_UPDATE: u32 = 0x8000 + 5;
 /// windows-sys has it in `SystemServices`, a large feature for one GUID.
 const GUID_CONSOLE_DISPLAY_STATE: GUID = GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
 /// After the cursor was last over the tray icon, its tooltip text is kept
@@ -106,6 +110,11 @@ const TIMER_PULSE: usize = 11;
 const TIMER_APP: usize = 12;
 /// Windows come and go in bursts: look once they've settled.
 const APP_SETTLE_MS: u32 = 150;
+/// One-shot, after an update: sweep the old exe away again (a hook may have
+/// been running it at the first try).
+const TIMER_SWEEP: usize = 13;
+const SWEEP_RETRY_MS: u32 = 30_000;
+const SWEEP_TRIES: u8 = 3;
 /// With its window gone the app may be on its way out, and nothing says
 /// when a process ends: look again this often, this many times.
 const APP_RECHECK_MS: u32 = 2000;
@@ -144,6 +153,7 @@ const CMD_LAUNCH_WITH_CLAUDE: usize = 51;
 const CMD_START_WITH_WINDOWS: usize = 52;
 const CMD_INSTALL_HOOKS: usize = 53;
 const CMD_UNINSTALL_HOOKS: usize = 54;
+const CMD_CHECK_UPDATES: usize = 55;
 const CMD_QUIT: usize = 99;
 const CMD_GOTO_BASE: usize = 100; // + the item's index in `App::goto_jumps`
 
@@ -291,6 +301,51 @@ struct Peek {
     fell: bool,
 }
 
+/// Where "Check for updates" is (PLAN.md §7, "Updating"). Nothing about it
+/// runs unless the user chose the menu item, or a test sent `__update`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Updating {
+    No,
+    Checking,
+    /// The question is open.
+    Asking,
+    /// Downloading, checking and putting the new exe in place.
+    Downloading,
+}
+
+/// `--send __update`: the menu's flow with no boxes.
+#[derive(Clone, Copy, PartialEq)]
+enum UpdateTest {
+    /// `--tool check`: log the verdict and stop.
+    CheckOnly,
+    /// Answer Yes by itself, and restart with `--quiet`.
+    Install,
+}
+
+/// What an update worker thread brings back.
+enum UpdateNews {
+    Checked(Result<Verdict, String>),
+    /// The new exe is in place (its version), or why not.
+    Placed(Result<Version, String>),
+}
+
+struct Updater {
+    state: Updating,
+    /// Filled by the worker, which then posts `WM_APP_UPDATE`. That message
+    /// is a plain wake-up: `LATER` may keep it and deliver it later.
+    news: Arc<Mutex<Option<UpdateNews>>>,
+    /// What this Clawd counts as (`update::setup`).
+    current: Version,
+    /// The exe to replace, read at the click, before anything is renamed.
+    exe: Option<PathBuf>,
+    test: Option<UpdateTest>,
+    /// The new exe is in place: what `run` starts once the window has gone.
+    restart: Option<(PathBuf, Vec<String>)>,
+    /// After an update: the exes to sweep beside again, and how many times.
+    sweep: Vec<PathBuf>,
+    sweeps_left: u8,
+}
+
 /// What a handler asks for that can only run once the state is free again
 /// (`enter` runs these after the handler returns). Each one runs a modal
 /// loop or hands the focus away, and Windows keeps delivering messages
@@ -299,6 +354,8 @@ enum After {
     Menu,
     Message { text: String, error: bool },
     Go(Jump),
+    /// "Update now?", then `update_answered`.
+    Ask { text: String, release: update::Release },
     Quit,
 }
 
@@ -316,6 +373,10 @@ impl After {
             // No owner: it would disable the pet window while it's open.
             After::Message { text, error } => super::message_box(&text, error),
             After::Go(jump) => jump.go(),
+            After::Ask { text, release } => {
+                let yes = super::ask(&text);
+                enter(|a| a.update_answered(yes, release));
+            }
             After::Quit => unsafe {
                 DestroyWindow(hwnd);
             },
@@ -335,6 +396,12 @@ pub struct Options {
     /// `scripts/perf.ps1`: the real window, timers and drawing, parked off
     /// every monitor so nothing appears on the screen.
     pub offscreen: bool,
+    /// Started by "Check for updates" in place of this version.
+    pub updated_from: Option<String>,
+    /// The pet that started this one: wait for it to end first.
+    pub wait_pid: Option<u32>,
+    /// No box about the update (the test command).
+    pub quiet: bool,
 }
 
 struct ArtWatch {
@@ -451,6 +518,7 @@ struct App {
     /// `--offscreen` / `--debug-log`: fullscreen isn't read from the real
     /// foreground window, so the user's own apps can't disturb a measurement.
     fake_fullscreen: Option<bool>,
+    updater: Updater,
     stats: Stats,
 }
 
@@ -530,7 +598,7 @@ fn handle_later(msg: u32, wp: WPARAM, lp: LPARAM) {
     }
     let keep = match msg {
         // Their lParam is a plain number.
-        WM_APP_EVENT | WM_APP_RECHECK | WM_APP_TRAY | WM_APP_DISPLAY | WM_ENDSESSION | WM_DESTROY => (msg, wp, lp),
+        WM_APP_EVENT | WM_APP_RECHECK | WM_APP_TRAY | WM_APP_DISPLAY | WM_APP_UPDATE | WM_ENDSESSION | WM_DESTROY => (msg, wp, lp),
         // Their lParam points at something that won't be there later, and
         // the handlers only read wParam.
         WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => (msg, wp, 0),
@@ -1277,6 +1345,13 @@ impl App {
                     crate::dlog!("menu command {cmd}");
                     self.on_command(cmd);
                 }
+                continue;
+            }
+            if m.e == "__update" && crate::debug::enabled() {
+                // The menu item's flow with no boxes; `--tool check` stops
+                // after the check.
+                let test = if m.t.as_deref() == Some("check") { UpdateTest::CheckOnly } else { UpdateTest::Install };
+                self.start_update(Some(test));
                 continue;
             }
             if m.e == "__menubuild" && crate::debug::enabled() {
@@ -2167,6 +2242,12 @@ impl App {
             item(menu, MF_STRING | checked(autostart::enabled()), CMD_START_WITH_WINDOWS, "Start with Windows");
             item(menu, MF_STRING | enabled(hooks.can_install), CMD_INSTALL_HOOKS, "Install Claude hooks");
             item(menu, MF_STRING | enabled(hooks.can_uninstall), CMD_UNINSTALL_HOOKS, "Uninstall Claude hooks");
+            let (text, free) = match self.updater.state {
+                Updating::No => ("Check for updates…", true),
+                Updating::Checking | Updating::Asking => ("Checking for updates…", false),
+                Updating::Downloading => ("Downloading update…", false),
+            };
+            item(menu, MF_STRING | enabled(free), CMD_CHECK_UPDATES, text);
             item(menu, MF_SEPARATOR, 0, "");
             item(menu, MF_STRING, CMD_QUIT, "Quit");
             menu
@@ -2293,6 +2374,7 @@ impl App {
             }
             CMD_INSTALL_HOOKS => self.after.push(After::result(install::install_hooks())),
             CMD_UNINSTALL_HOOKS => self.after.push(After::result(install::uninstall_hooks())),
+            CMD_CHECK_UPDATES => self.start_update(None),
             CMD_QUIT => self.after.push(After::Quit),
             c if (CMD_GOTO_BASE..CMD_GOTO_BASE + goto::MAX_TARGETS).contains(&c) => {
                 // The window may have closed while the menu was open.
@@ -2305,6 +2387,139 @@ impl App {
             _ => {}
         }
         self.goto_jumps.clear();
+    }
+
+    // ---- "Check for updates" (PLAN.md §7, "Updating") ----
+
+    /// The user's click (or `__update`): ask GitHub on a worker thread.
+    fn start_update(&mut self, test: Option<UpdateTest>) {
+        if self.updater.state != Updating::No {
+            crate::dlog!("update: already {:?}", self.updater.state);
+            return;
+        }
+        self.updater.test = test;
+        let (source, current) = match update::setup() {
+            Ok(setup) => setup,
+            Err(text) => return self.update_finished(&text, true),
+        };
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => return self.update_finished(&format!("Could not find this program's own path: {e}."), true),
+        };
+        crate::dlog!("update: checking {} as {current}", source.api);
+        self.updater.current = current;
+        self.updater.exe = Some(exe);
+        self.updater.state = Updating::Checking;
+        self.spawn_update_worker(move || UpdateNews::Checked(update::check(&http::get, &source, current)));
+    }
+
+    /// Run `work` on its own thread, then wake the window with its news.
+    /// Nothing on that thread may panic (`panic = "abort"`).
+    fn spawn_update_worker(&mut self, work: impl FnOnce() -> UpdateNews + Send + 'static) {
+        let news = self.updater.news.clone();
+        let target = self.hwnd as usize; // HWND isn't Send; it's just a handle
+        let spawned = std::thread::Builder::new().name("update".into()).spawn(move || {
+            let result = work();
+            *news.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+            // Fails only when the window has gone (Clawd quit meanwhile):
+            // nobody to tell, and nothing was written before `place_bytes`.
+            unsafe { PostMessageW(target as HWND, WM_APP_UPDATE, 0, 0) };
+        });
+        if let Err(e) = spawned {
+            self.update_finished(&format!("Could not start the update: {e}."), true);
+        }
+    }
+
+    fn on_update_news(&mut self) {
+        let Some(news) = self.updater.news.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        let current = self.updater.current;
+        match news {
+            UpdateNews::Checked(Err(text)) | UpdateNews::Placed(Err(text)) => self.update_finished(&text, true),
+            UpdateNews::Checked(Ok(Verdict::UpToDate)) => {
+                crate::dlog!("update: up to date ({current})");
+                self.update_finished(&update::up_to_date_text(current), false);
+            }
+            UpdateNews::Checked(Ok(Verdict::Ahead(latest))) => {
+                crate::dlog!("update: ahead of the latest release ({current} > {latest})");
+                self.update_finished(&update::ahead_text(current, latest), false);
+            }
+            UpdateNews::Checked(Ok(Verdict::Newer(release))) => {
+                crate::dlog!("update: {} is available (have {current})", release.version);
+                match self.updater.test {
+                    Some(UpdateTest::CheckOnly) => self.update_finished("", false),
+                    Some(UpdateTest::Install) => self.update_answered(true, release),
+                    None => {
+                        self.updater.state = Updating::Asking;
+                        self.after.push(After::Ask { text: update::ask_text(current, release.version), release });
+                    }
+                }
+            }
+            UpdateNews::Placed(Ok(new)) => self.restart_updated(new),
+        }
+    }
+
+    /// The check or download ended without a restart: say how (no box for
+    /// the test command).
+    fn update_finished(&mut self, text: &str, error: bool) {
+        if error {
+            crate::dlog!("update: failed: {text}");
+        }
+        self.updater.state = Updating::No;
+        if self.updater.test.is_none() {
+            self.after.push(After::Message { text: text.to_string(), error });
+        }
+        // WinHTTP brought in several DLLs, and nothing needs them now.
+        trim_working_set();
+    }
+
+    /// The answer to "Update now?". Yes: download, check, swap on a worker.
+    fn update_answered(&mut self, yes: bool, release: update::Release) {
+        if !yes {
+            crate::dlog!("update: declined");
+            self.updater.state = Updating::No;
+            trim_working_set();
+            return;
+        }
+        let Some(exe) = self.updater.exe.clone() else { return self.update_finished("Could not find this program's own path.", true) };
+        crate::dlog!("update: downloading {}", release.url);
+        self.updater.state = Updating::Downloading;
+        self.spawn_update_worker(move || {
+            let placed = update::download(&http::get, &release).and_then(|bytes| {
+                install::place_bytes(&bytes, &exe).map_err(|e| format!("Could not replace {}: {e}. Clawd was left as it was.", exe.display()))
+            });
+            UpdateNews::Placed(placed.map(|()| release.version))
+        });
+    }
+
+    /// The new exe is in place: close, and have `run` start it.
+    fn restart_updated(&mut self, new: Version) {
+        let Some(exe) = self.updater.exe.clone() else { return };
+        crate::dlog!("update: {new} is in place, restarting");
+        let mut args = vec!["--updated-from".to_string(), self.updater.current.to_string(), "--wait-pid".into(), std::process::id().to_string()];
+        if crate::debug::enabled() {
+            args.push("--debug-log".into());
+        }
+        // Not in the config, so it has to be passed on.
+        if !self.visible {
+            args.push("--hidden".into());
+        }
+        if self.updater.test.is_some() {
+            args.push("--quiet".into());
+        }
+        self.updater.restart = Some((exe, args));
+        self.after.push(After::Quit);
+    }
+
+    /// `TIMER_SWEEP`: the old exe once more, a few times at most.
+    fn sweep_again(&mut self) {
+        let left: usize = self.updater.sweep.iter().map(|exe| install::sweep_leftovers(exe)).sum();
+        crate::dlog!("update: {left} leftover(s) still there");
+        self.updater.sweeps_left = self.updater.sweeps_left.saturating_sub(1);
+        if left > 0 && self.updater.sweeps_left > 0 {
+            unsafe { SetTimer(self.hwnd, TIMER_SWEEP, SWEEP_RETRY_MS, None) };
+        } else {
+            self.updater.sweep.clear();
+        }
     }
 
     fn on_dpi_changed(&mut self, dpi: u32) {
@@ -2385,6 +2600,7 @@ impl App {
             },
             WM_APP_DISPLAY => self.set_display_off(wp == 0),
             WM_APP_EVENT => self.on_ipc(),
+            WM_APP_UPDATE => self.on_update_news(),
             WM_APP_RECHECK => self.recheck_windows(),
             WM_TIMER if wp == TIMER_SAVE => self.save_now(),
             WM_TIMER if wp == TIMER_TICK => {
@@ -2400,6 +2616,10 @@ impl App {
             WM_TIMER if wp == TIMER_FADE => self.on_fade_tick(),
             WM_TIMER if wp == TIMER_WALK => self.on_walk_tick(),
             WM_TIMER if wp == TIMER_PULSE => self.on_pulse_timer(),
+            WM_TIMER if wp == TIMER_SWEEP => {
+                unsafe { KillTimer(hwnd, wp) };
+                self.sweep_again();
+            }
             WM_TIMER if wp == TIMER_APP => {
                 unsafe { KillTimer(hwnd, wp) };
                 self.check_claude_app();
@@ -2526,7 +2746,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 /// Pet mode. Returns when the user quits.
 pub fn run(opts: Options) {
-    let Options { seed, hidden, demo, art, offscreen } = opts;
+    let Options { seed, hidden, demo, art, offscreen, updated_from, wait_pid, quiet } = opts;
+
+    // Started by an update: the old pet holds the UDP port (and held the
+    // mutex) until its process ends.
+    if let Some(pid) = wait_pid {
+        let t = Instant::now();
+        process::wait_for_exit(pid, 5000);
+        crate::dlog!("waited {} ms for pid {pid} to end", t.elapsed().as_millis());
+    }
+    // Before the mutex: a pet that a hook launched meanwhile may win it, and
+    // the housekeeping must happen all the same.
+    let updated = updated_from.map(|old| {
+        let done = install::refresh_after_update();
+        let new = Version::current();
+        crate::dlog!(
+            "updated from {old} to {new} (hooks updated: {}, leftovers: {}, problem: {:?})",
+            done.hooks_updated,
+            done.leftovers,
+            done.problem
+        );
+        let mut text = update::updated_text(&old, new, done.hooks_updated);
+        if let Some(problem) = &done.problem {
+            text = format!("{text}\n\n{problem}");
+        }
+        (text, done)
+    });
 
     let cfg_path = config::default_path();
     let cfg = cfg_path.as_deref().map(config::load).unwrap_or_default();
@@ -2540,6 +2785,11 @@ pub fn run(opts: Options) {
     if mutex.is_null() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         crate::dlog!("already running");
         ipc::send(&seed.unwrap_or_else(|| IpcMsg { v: 1, e: "__show".into(), ..Default::default() }), port);
+        if let Some((text, done)) = &updated
+            && !quiet
+        {
+            super::message_box(text, done.problem.is_some());
+        }
         return;
     }
 
@@ -2669,6 +2919,16 @@ pub fn run(opts: Options) {
             park: if offscreen { PARKED_AT } else { (0, 0) },
             fake_cursor: None,
             fake_fullscreen: offscreen.then_some(false),
+            updater: Updater {
+                state: Updating::No,
+                news: Arc::default(),
+                current: Version::current(),
+                exe: None,
+                test: None,
+                restart: None,
+                sweep: Vec::new(),
+                sweeps_left: 0,
+            },
             stats: Stats::default(),
             sheet,
         });
@@ -2728,6 +2988,16 @@ pub fn run(opts: Options) {
             } else {
                 a.refresh();
             }
+            if let Some((text, done)) = updated {
+                if !quiet {
+                    a.after.push(After::Message { text, error: done.problem.is_some() });
+                }
+                if done.leftovers > 0 {
+                    a.updater.sweep = done.exes;
+                    a.updater.sweeps_left = SWEEP_TRIES;
+                    SetTimer(hwnd, TIMER_SWEEP, SWEEP_RETRY_MS, None);
+                }
+            }
         });
 
         trim_working_set();
@@ -2738,6 +3008,17 @@ pub fn run(opts: Options) {
             DispatchMessageW(&msg);
         }
         // The loop has ended, so nothing is inside the state any more.
-        drop(Box::from_raw(APP.swap(std::ptr::null_mut(), Ordering::Relaxed)));
+        let mut app = Box::from_raw(APP.swap(std::ptr::null_mut(), Ordering::Relaxed));
+        let restart = app.updater.restart.take();
+        drop(app);
+        // An update is in place: start it. It waits for this process to end,
+        // which also frees the port; the mutex goes now.
+        if let Some((exe, args)) = restart {
+            CloseHandle(mutex);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            if !launch::spawn_detached(&exe, &args) {
+                crate::dlog!("update: could not start {}: {}", exe.display(), std::io::Error::last_os_error());
+            }
+        }
     }
 }

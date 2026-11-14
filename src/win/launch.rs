@@ -2,6 +2,7 @@
 
 use std::iter::repeat_n;
 use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use super::wide;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, GetLastError};
 use windows_sys::Win32::System::Threading::{
@@ -59,10 +60,7 @@ fn quote_arg(a: &str) -> String {
     out
 }
 
-/// Spawn this exe again with `args`, detached, without inheriting handles.
-/// It runs from the exe's own folder: the hook's working directory is the
-/// user's project, and a long-lived pet would keep that folder open, so it
-/// couldn't be renamed or deleted.
+/// Spawn this exe again with `args`, detached (`spawn_detached`).
 ///
 /// `env` is added to this process's environment first, and so to the new
 /// one's: the way to hand over something that shouldn't sit on a command
@@ -73,6 +71,15 @@ pub fn spawn_self_detached(args: &[&str], env: &[(&str, &str)]) {
         // SAFETY: the hook has no other threads.
         unsafe { std::env::set_var(name, value) };
     }
+    spawn_detached(&exe, args);
+}
+
+/// Start `exe` with `args`, detached, without inheriting handles; false if
+/// it couldn't be started. It runs from the exe's own folder: the hook's
+/// working directory is the user's project, and a long-lived pet would keep
+/// that folder open, so it couldn't be renamed or deleted. The environment
+/// is this process's, unchanged.
+pub fn spawn_detached(exe: &Path, args: &[&str]) -> bool {
     let mut cmd = format!("\"{}\"", exe.display());
     for a in args {
         cmd.push(' ');
@@ -104,9 +111,10 @@ pub fn spawn_self_detached(args: &[&str], env: &[(&str, &str)]) {
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
             }
-            return;
+            return true;
         }
     }
+    false
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ mod rng;
 mod sound;
 mod sprite;
 mod tracker;
+mod update;
 mod walk;
 #[cfg(windows)]
 mod win;
@@ -143,8 +144,22 @@ fn main() {
     // `--hidden`: start with only the tray icon (testing without covering the
     // screen). The variable does the same for a pet the hook launches.
     let hidden = has("--hidden") || std::env::var_os("CLAWD_PET_HIDDEN").is_some();
+    // After "Check for updates": the version this replaced, and the old
+    // pet's pid, whose port and single-instance mutex this one waits for.
+    // `--quiet`: no box about it (the test command).
+    let updated_from = value(&args, "--updated-from").map(str::to_string);
+    let wait_pid = value(&args, "--wait-pid").and_then(|p| p.parse().ok());
     #[cfg(windows)]
-    win::window::run(win::window::Options { seed, hidden: hidden && !has("--offscreen"), demo: has("--demo"), art, offscreen: has("--offscreen") });
+    win::window::run(win::window::Options {
+        seed,
+        hidden: hidden && !has("--offscreen"),
+        demo: has("--demo"),
+        art,
+        offscreen: has("--offscreen"),
+        updated_from,
+        wait_pid,
+        quiet: has("--quiet"),
+    });
     #[cfg(not(windows))]
-    let _ = (seed, hidden, art);
+    let _ = (seed, hidden, art, updated_from, wait_pid);
 }

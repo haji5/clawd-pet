@@ -1,0 +1,52 @@
+{
+  "url": "https://api.github.com/repos/haji5/clawd-pet/releases/444887560",
+  "assets_url": "https://api.github.com/repos/haji5/clawd-pet/releases/444887560/assets",
+  "upload_url": "https://uploads.github.com/repos/haji5/clawd-pet/releases/444887560/assets{?name,label}",
+  "html_url": "https://github.com/haji5/clawd-pet/releases/tag/v0.1.1",
+  "id": 444887560,
+  "node_id": "RE_kwDOVtgUk84ahHII",
+  "tag_name": "v0.1.1",
+  "target_commitish": "main",
+  "name": "Clawd Pet v0.1.1",
+  "draft": false,
+  "immutable": false,
+  "prerelease": false,
+  "created_at": "2026-11-14T00:38:53Z",
+  "updated_at": "2026-11-14T00:41:41Z",
+  "published_at": "2026-11-14T00:39:17Z",
+  "assets": [
+    {
+      "url": "https://api.github.com/repos/haji5/clawd-pet/releases/assets/745749682",
+      "id": 745749682,
+      "node_id": "RA_kwDOVtgUk84sczyy",
+      "name": "clawd-pet.exe",
+      "label": "",
+      "content_type": "application/x-msdownload",
+      "state": "uploaded",
+      "size": 771072,
+      "digest": "sha256:9e23c9aec018708ae31019545d3ae986a1fe04c90126d066f7d3156982233cd6",
+      "download_count": 1,
+      "created_at": "2026-11-14T00:39:16Z",
+      "updated_at": "2026-11-14T00:39:16Z",
+      "browser_download_url": "https://github.com/haji5/clawd-pet/releases/download/v0.1.1/clawd-pet.exe"
+    },
+    {
+      "url": "https://api.github.com/repos/haji5/clawd-pet/releases/assets/745749683",
+      "id": 745749683,
+      "node_id": "RA_kwDOVtgUk84sczyz",
+      "name": "clawd-pet.exe.sha256",
+      "label": "",
+      "content_type": "application/octet-stream",
+      "state": "uploaded",
+      "size": 80,
+      "digest": "sha256:4e8970b40cb2ab494c7ee0eff8a0f6e8811002803df7aadb80c97379505334dc",
+      "download_count": 1,
+      "created_at": "2026-11-14T00:39:16Z",
+      "updated_at": "2026-11-14T00:39:16Z",
+      "browser_download_url": "https://github.com/haji5/clawd-pet/releases/download/v0.1.1/clawd-pet.exe.sha256"
+    }
+  ],
+  "tarball_url": "https://api.github.com/repos/haji5/clawd-pet/tarball/v0.1.1",
+  "zipball_url": "https://api.github.com/repos/haji5/clawd-pet/zipball/v0.1.1",
+  "body": ""
+}

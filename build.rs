@@ -11,7 +11,7 @@ const RT_MANIFEST: u16 = 24;
 const LANG_EN_US: u16 = 0x0409;
 const ICO: &str = "assets/clawd.ico";
 const MANIFEST: &str = "assets/clawd.manifest";
-const DELAY_LOADED: &[&str] = &["user32.dll", "gdi32.dll", "shell32.dll", "dwmapi.dll", "advapi32.dll", "imm32.dll", "api-ms-win-shcore-scaling-l1-1-1.dll", "bcryptprimitives.dll"];
+const DELAY_LOADED: &[&str] = &["user32.dll", "gdi32.dll", "shell32.dll", "dwmapi.dll", "advapi32.dll", "imm32.dll", "api-ms-win-shcore-scaling-l1-1-1.dll", "bcryptprimitives.dll", "winhttp.dll"];
 
 /// One resource: a 32-byte header with numeric type and id, then the data,
 /// padded to a 4-byte boundary.

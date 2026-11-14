@@ -335,36 +335,118 @@ fn differs(from: &Path, to: &Path) -> bool {
     !matches!((fs::read(from), fs::read(to)), (Ok(a), Ok(b)) if a == b)
 }
 
-/// Copy the exe into place; false if it was already there. The old exe may
+/// A file beside `exe` named after it: `<name>.new`, `<name>.old-<pid>`.
+fn beside(exe: &Path, suffix: &str) -> PathBuf {
+    exe.with_file_name(format!("{}.{suffix}", exe.file_name().unwrap_or_default().to_string_lossy()))
+}
+
+/// Put `new`, a finished file beside `to`, in `to`'s place. The old exe may
 /// be running (the pet, or a hook firing right now): it can't be overwritten
-/// but it can be renamed, and the leftovers are swept up on the next install.
-fn place_exe(from: &Path, to: &Path) -> io::Result<bool> {
-    if !differs(from, to) {
-        return Ok(false);
-    }
-    let dir = to.parent().ok_or_else(|| io::Error::other("no install folder"))?;
-    fs::create_dir_all(dir)?;
-    let new = to.with_extension("exe.new");
-    fs::copy(from, &new)?;
-    let old = to.with_extension(format!("exe.old-{}", std::process::id()));
+/// but it can be renamed, and `sweep_leftovers` removes it once it's free.
+/// On failure `to` is as it was and `new` is gone.
+fn swap_in(new: &Path, to: &Path) -> io::Result<()> {
+    let old = beside(to, &format!("old-{}", std::process::id()));
     let moved_old = to.exists();
     let swapped = if moved_old { fs::rename(to, &old) } else { Ok(()) }.and_then(|()| {
-        fs::rename(&new, to).inspect_err(|_| {
+        fs::rename(new, to).inspect_err(|_| {
             if moved_old {
                 let _ = fs::rename(&old, to);
             }
         })
     });
     if let Err(e) = swapped {
+        let _ = fs::remove_file(new);
+        return Err(e);
+    }
+    sweep_leftovers(to);
+    Ok(())
+}
+
+/// Remove what earlier swaps left beside `exe` (`<name>.old-*`, `<name>.new`)
+/// and return how many are still there: an old exe that a process still
+/// runs can't be deleted yet.
+pub fn sweep_leftovers(exe: &Path) -> usize {
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else { return 0 };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    let (old, new) = (format!("{name}.old-"), format!("{name}.new"));
+    let Ok(entries) = fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            n.starts_with(&old) || n == new
+        })
+        .filter(|e| fs::remove_file(e.path()).is_err())
+        .count()
+}
+
+/// Copy the exe into place; false if it was already there.
+fn place_exe(from: &Path, to: &Path) -> io::Result<bool> {
+    if !differs(from, to) {
+        return Ok(false);
+    }
+    let dir = to.parent().ok_or_else(|| io::Error::other("no install folder"))?;
+    fs::create_dir_all(dir)?;
+    let new = beside(to, "new");
+    if let Err(e) = fs::copy(from, &new) {
         let _ = fs::remove_file(&new);
         return Err(e);
     }
-    for entry in fs::read_dir(dir)?.flatten() {
-        if entry.file_name().to_string_lossy().starts_with("clawd-pet.exe.old-") {
-            let _ = fs::remove_file(entry.path());
+    swap_in(&new, to)?;
+    Ok(true)
+}
+
+/// Write `bytes` over the exe at `to` ("Check for updates"), the same way.
+pub fn place_bytes(bytes: &[u8], to: &Path) -> io::Result<()> {
+    let dir = to.parent().ok_or_else(|| io::Error::other("no folder"))?;
+    fs::create_dir_all(dir)?;
+    let new = beside(to, "new");
+    if let Err(e) = fs::write(&new, bytes) {
+        let _ = fs::remove_file(&new);
+        return Err(e);
+    }
+    swap_in(&new, to)
+}
+
+/// What the first start of a new version did (`refresh_after_update`).
+#[derive(Debug, Default)]
+pub struct AfterUpdate {
+    /// The hook entries in `settings.json` were out of date and were rewritten.
+    pub hooks_updated: bool,
+    /// Something that couldn't be done, as a sentence for the box.
+    pub problem: Option<String>,
+    /// Leftovers beside the exes that couldn't be removed yet.
+    pub leftovers: usize,
+    /// The exes to sweep beside again later.
+    pub exes: Vec<PathBuf>,
+}
+
+/// The first start after "Check for updates" replaced this exe: sweep the
+/// old one away, bring the installed copy level if this is another file,
+/// and rewrite Clawd's hooks if they are installed and out of date. Hooks
+/// that aren't installed are never added.
+pub fn refresh_after_update() -> AfterUpdate {
+    let mut done = AfterUpdate::default();
+    let me = std::env::current_exe().ok();
+    done.exes.extend(me.clone());
+    if let (Some(me), Some(installed)) = (&me, installed_exe())
+        && installed.exists()
+        && !same_file(me, &installed)
+    {
+        if let Err(e) = ensure_installed() {
+            done.problem = Some(format!("{e}."));
+        }
+        done.exes.push(installed);
+    }
+    let status = hook_status();
+    if status.can_uninstall && status.can_install {
+        match install_hooks() {
+            Ok(_) => done.hooks_updated = true,
+            Err(e) => done.problem = Some(e),
         }
     }
-    Ok(true)
+    done.leftovers = done.exes.iter().map(|e| sweep_leftovers(e)).sum();
+    done
 }
 
 /// Makes sure the running exe is the installed copy, so hooks and the Run
@@ -846,6 +928,59 @@ mod tests {
         assert!(place_exe(&from, &to).unwrap());
         assert_eq!(fs::read(&to).unwrap(), b"v2");
         assert_eq!(files_in(to.parent().unwrap()), [EXE_NAME], "no leftovers");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn places_bytes_where_there_was_no_file_or_an_old_one() {
+        let dir = temp_dir("bytes");
+        let to = dir.join("sub").join("clawd-pet (1).exe");
+        place_bytes(b"first", &to).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"first");
+        place_bytes(b"second", &to).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"second");
+        assert_eq!(files_in(to.parent().unwrap()), ["clawd-pet (1).exe"], "no leftovers, whatever the exe is called");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_running_exe_is_swapped_out_and_swept_once_it_has_stopped() {
+        let dir = temp_dir("running");
+        let to = dir.join(EXE_NAME);
+        // A real program, running from `to` while it's replaced.
+        fs::copy(std::env::var_os("ComSpec").expect("ComSpec"), &to).unwrap();
+        let mut running = std::process::Command::new(&to).args(["/c", "ping -n 30 127.0.0.1 >nul"]).spawn().unwrap();
+        place_bytes(b"MZ new", &to).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"MZ new");
+        let old = format!("{EXE_NAME}.old-{}", std::process::id());
+        assert_eq!(files_in(&dir), [EXE_NAME.to_string(), old.clone()], "the running one is only renamed");
+        assert_eq!(sweep_leftovers(&to), 1, "still running");
+        running.kill().unwrap();
+        running.wait().unwrap();
+        assert_eq!(sweep_leftovers(&to), 0);
+        assert_eq!(files_in(&dir), [EXE_NAME]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_sweep_takes_only_leftovers_of_that_exe() {
+        let dir = temp_dir("sweep");
+        for name in [
+            "clawd-pet (1).exe",
+            "clawd-pet (1).exe.new",
+            "clawd-pet (1).exe.old-123",
+            "Clawd-Pet (1).EXE.OLD-9",
+            "clawd-pet.exe",
+            "clawd-pet.exe.old-5",
+            "clawd-pet (1).exe.newer",
+            "notes.txt",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        assert_eq!(sweep_leftovers(&dir.join("clawd-pet (1).exe")), 0);
+        assert_eq!(files_in(&dir), ["clawd-pet (1).exe", "clawd-pet (1).exe.newer", "clawd-pet.exe", "clawd-pet.exe.old-5", "notes.txt"]);
+        assert_eq!(sweep_leftovers(&dir.join("clawd-pet.exe")), 0);
+        assert_eq!(files_in(&dir), ["clawd-pet (1).exe", "clawd-pet (1).exe.newer", "clawd-pet.exe", "notes.txt"]);
         fs::remove_dir_all(&dir).unwrap();
     }
 }
