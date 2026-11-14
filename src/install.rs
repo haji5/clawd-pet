@@ -171,9 +171,12 @@ fn read_settings(path: &Path) -> Result<Option<(Vec<u8>, Value)>, String> {
 fn write_backup(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let stamp = crate::hook::unix_now();
-    for n in 0..100 {
+    // Above every number already used in this second, even by a backup that
+    // has since been pruned away, so `backups` can order them by name.
+    let first = backup_files(path).filter_map(|(_, order)| order).filter(|&(s, _)| s == stamp).map(|(_, n)| n + 1).max().unwrap_or(0);
+    for n in first..first + 100 {
         let suffix = if n == 0 { String::new() } else { format!("-{n}") };
-        let candidate = path.with_file_name(format!("{name}.clawd-backup-{stamp}{suffix}"));
+        let candidate = path.with_file_name(format!("{name}{BACKUP_MARK}{stamp}{suffix}"));
         match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
             Ok(mut f) => {
                 f.write_all(bytes)?;
@@ -190,19 +193,40 @@ fn write_backup(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
 /// newest few are kept; older ones are removed, or they'd pile up for good.
 const KEEP_BACKUPS: usize = 5;
 
-/// Clawd's backups of the settings file at `path`, newest first.
+/// Clawd's backups of the settings file at `path`, newest first. Backups
+/// written in the same clock tick have the same modification time, so a tie
+/// goes by the stamp and number in the name.
 fn backups(path: &Path) -> Vec<PathBuf> {
-    let Some(dir) = path.parent() else { return Vec::new() };
-    let prefix = format!("{}.clawd-backup-", path.file_name().unwrap_or_default().to_string_lossy());
-    let mut found: Vec<_> = fs::read_dir(dir)
+    let mut found: Vec<_> = backup_files(path)
+        .filter_map(|(path, order)| Some((fs::metadata(&path).ok()?.modified().ok()?, order, path)))
+        .collect();
+    found.sort_by(|a, b| b.cmp(a));
+    found.into_iter().map(|(_, _, path)| path).collect()
+}
+
+/// Every backup of the settings file at `path`, with its `backup_order`.
+fn backup_files(path: &Path) -> impl Iterator<Item = (PathBuf, Option<(u64, u32)>)> {
+    let prefix = format!("{}{BACKUP_MARK}", path.file_name().unwrap_or_default().to_string_lossy());
+    path.parent()
+        .and_then(|dir| fs::read_dir(dir).ok())
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    found.sort_by(|a, b| b.cmp(a));
-    found.into_iter().map(|(_, path)| path).collect()
+        .filter_map(move |e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with(&prefix).then(|| (e.path(), backup_order(&name)))
+        })
+}
+
+const BACKUP_MARK: &str = ".clawd-backup-";
+
+/// The stamp and number `write_backup` put in a backup's name
+/// (`….clawd-backup-<stamp>` or `…-<stamp>-<n>`), compared as numbers so
+/// that `-10` comes after `-9`. `None` for a name it didn't write.
+fn backup_order(file_name: &str) -> Option<(u64, u32)> {
+    let rest = &file_name[file_name.rfind(BACKUP_MARK)? + BACKUP_MARK.len()..];
+    let (stamp, n) = rest.split_once('-').unwrap_or((rest, "0"));
+    Some((stamp.parse().ok()?, n.parse().ok()?))
 }
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -724,6 +748,34 @@ mod tests {
         let (merged, backup) = install_into(&path, EXE, None).unwrap();
         assert_eq!((merged, backup), (Merged::default(), None));
         assert_eq!(files_in(&dir).len(), 2, "the settings and the one backup");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn backup_names_order_by_stamp_then_number() {
+        assert_eq!(backup_order("settings.json.clawd-backup-1700000000"), Some((1_700_000_000, 0)));
+        assert_eq!(backup_order("settings.json.clawd-backup-1700000000-9"), Some((1_700_000_000, 9)));
+        assert!(backup_order("settings.json.clawd-backup-1700000000-10") > backup_order("settings.json.clawd-backup-1700000000-9"));
+        assert!(backup_order("settings.json.clawd-backup-1700000001") > backup_order("settings.json.clawd-backup-1700000000-99"));
+        for odd in ["settings.json.clawd-backup-", "settings.json.clawd-backup-x", "settings.json.clawd-backup-1-x", "settings.json"] {
+            assert_eq!(backup_order(odd), None, "{odd}");
+        }
+    }
+
+    #[test]
+    fn a_pruned_number_is_not_used_again() {
+        let dir = temp_dir("renumber");
+        let path = dir.join("settings.json");
+        let first = write_backup(&path, b"one").unwrap();
+        let second = write_backup(&path, b"two").unwrap();
+        fs::remove_file(&first).unwrap();
+        let third = write_backup(&path, b"three").unwrap();
+        let order = |p: &Path| backup_order(&p.file_name().unwrap().to_string_lossy()).unwrap();
+        // In the same second, the third must still sort after the second.
+        if order(&third).0 == order(&second).0 {
+            assert!(order(&third) > order(&second), "{third:?} vs {second:?}");
+        }
+        assert_eq!(backups(&path)[0], third);
         fs::remove_dir_all(&dir).unwrap();
     }
 
