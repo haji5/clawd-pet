@@ -21,6 +21,14 @@ impl Drop for Hooks {
     }
 }
 
+impl Hooks {
+    /// Is `hook` one of these? Two sets of hooks can watch the same thread,
+    /// and then one event arrives once through each.
+    pub fn has(&self, hook: HWINEVENTHOOK) -> bool {
+        self.0.contains(&hook)
+    }
+}
+
 fn install(ranges: &[(u32, u32)], pid: u32, tid: u32, cb: WINEVENTPROC) -> Hooks {
     let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
     let hooks = ranges

@@ -32,7 +32,7 @@ use crate::feel;
 use crate::goto::{self, Host};
 use crate::install;
 use crate::interaction::{self, Click, Hand, Release, Swing};
-use crate::perch::{self, Fit, Foreground, Ride, RideEvent, Screen};
+use crate::perch::{self, Fit, Foreground, Ride, RideEvent, Screen, WindowInfo};
 use crate::mood::{self, Clock, Mood};
 use crate::physics::{self, Floor, Sim, World};
 use crate::ipc::{self, IpcMsg, Queue};
@@ -417,6 +417,8 @@ struct App {
     attention: bool,
     /// While the menu is open: where each "Go to" item leads.
     goto_jumps: Vec<Option<Jump>>,
+    /// `install::hook_status` as of the last menu, and what it read.
+    hook_status: Option<(install::StatusKey, install::HookStatus)>,
     /// For `enter` to run once the current handler has returned.
     after: Vec<After>,
     /// While a session is stuck waiting: when to check its process next.
@@ -577,7 +579,15 @@ impl App {
     /// position changed (always with `force`, e.g. after the surface was
     /// recreated). Moving and redrawing happen in one `UpdateLayeredWindow`,
     /// and only the pixels that changed are converted and copied.
+    ///
+    /// Nothing while the window is hidden, unless forced: the only way back
+    /// up (`update_presence`) redraws with `force` before showing it. A fade
+    /// or the display being off still draws, so the picture is right when
+    /// they end.
     fn redraw(&mut self, force: bool) {
+        if !force && self.presence == Shown::Hidden {
+            return;
+        }
         let look = self.director.look(&self.sheet, self.now());
         // The same layers give the same pixels: a drag or a stroll only has
         // to move the window.
@@ -829,20 +839,23 @@ impl App {
     }
 
     /// The perch window moved, changed or needs rechecking: follow it, or
-    /// fall if it can't be stood on any more.
-    fn on_perch_moved(&mut self) {
+    /// fall if it can't be stood on any more. Returns the window as it was
+    /// read, so a perch on the foreground window can also tell whether it
+    /// went fullscreen without reading it again.
+    fn on_perch_moved(&mut self) -> Option<WindowInfo> {
         let now = self.now();
         let scale = self.scale();
-        let Some(hwnd) = self.perch().map(|p| p.hwnd) else { return };
+        let hwnd = self.perch().map(|p| p.hwnd)?;
         let fit = Fit { screens: &self.screens, deny: &[], clawd_h: self.clawd_h(), scale };
         // The deny-list can't change mid-ride: no need to look up the process.
-        let Some(info) = windows::info(hwnd, self.hwnd, false).filter(|i| perch::eligible(i, &fit)) else {
+        let info = windows::info(hwnd, self.hwnd, false);
+        let Some(bounds) = info.as_ref().filter(|i| perch::eligible(i, &fit)).map(|i| i.bounds) else {
             self.fall_off("window can't be perched on any more", None);
-            return;
+            return info;
         };
-        let Motion::Perched(p) = &mut self.motion else { return };
-        let event = p.ride.moved(now, info.bounds.l, info.bounds.t, scale);
-        let (fx, fy) = p.ride.feet(info.bounds, scale);
+        let Motion::Perched(p) = &mut self.motion else { return info };
+        let event = p.ride.moved(now, bounds.l, bounds.t, scale);
+        let (fx, fy) = p.ride.feet(bounds, scale);
         let velocity = p.ride.velocity(now, scale);
         if event == RideEvent::Moved && !p.riding {
             p.riding = true;
@@ -856,6 +869,7 @@ impl App {
         if event == RideEvent::KnockedOff {
             self.fall_off("shaken off", Some(velocity));
         }
+        info
     }
 
     /// While the perch window moves: lean against the motion, then settle.
@@ -907,7 +921,7 @@ impl App {
         self.refresh();
     }
 
-    fn on_win_event(&mut self, event: u32, hwnd: HWND) {
+    fn on_win_event(&mut self, hook: HWINEVENTHOOK, event: u32, hwnd: HWND) {
         if matches!(event, EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_OBJECT_DESTROY) {
             self.check_claude_app_soon();
         }
@@ -917,13 +931,24 @@ impl App {
         }
         if self.perch().is_some_and(|p| p.hwnd == hwnd) {
             match event {
-                EVENT_OBJECT_LOCATIONCHANGE => self.on_perch_moved(),
+                // Perched on the foreground window, a move arrives through
+                // the perch's hooks and again through the foreground's
+                // location hook. The perch's copy does both jobs; the
+                // fullscreen check reads what the perch just read.
+                EVENT_OBJECT_LOCATIONCHANGE if self.fg_location.as_ref().is_some_and(|l| l.0.has(hook)) => {}
+                EVENT_OBJECT_LOCATIONCHANGE => {
+                    let info = self.on_perch_moved();
+                    if hwnd == self.fg_hwnd {
+                        self.judge_fullscreen(info);
+                    }
+                }
                 EVENT_SYSTEM_MINIMIZESTART => self.fall_off("minimized", None),
                 EVENT_OBJECT_DESTROY => self.fall_off("closed", None),
                 EVENT_OBJECT_HIDE => self.fall_off("hidden", None),
                 EVENT_OBJECT_CLOAKED => self.fall_off("cloaked", None),
                 _ => {}
             }
+            return;
         }
         if event == EVENT_OBJECT_LOCATIONCHANGE && hwnd == self.fg_hwnd {
             self.check_fullscreen();
@@ -1036,7 +1061,13 @@ impl App {
     // ---- fullscreen apps ----
 
     fn check_fullscreen(&mut self) {
-        let Some(w) = windows::info(self.fg_hwnd, self.hwnd, false) else { return };
+        let w = windows::info(self.fg_hwnd, self.hwnd, false);
+        self.judge_fullscreen(w);
+    }
+
+    /// `check_fullscreen` with the foreground window already read.
+    fn judge_fullscreen(&mut self, w: Option<WindowInfo>) {
+        let Some(w) = w else { return };
         let fullscreen = match (self.fake_fullscreen, perch::classify_foreground(&w, &self.screens)) {
             (Some(fake), _) => fake,
             (None, Foreground::Fullscreen) => true,
@@ -1246,6 +1277,16 @@ impl App {
                     crate::dlog!("menu command {cmd}");
                     self.on_command(cmd);
                 }
+                continue;
+            }
+            if m.e == "__menubuild" && crate::debug::enabled() {
+                // What opening the menu costs, without opening it.
+                let t = Instant::now();
+                let (menu, watching) = self.build_menu();
+                let took = t.elapsed();
+                unsafe { DestroyMenu(menu) };
+                self.menu_closed(watching, 0);
+                crate::dlog!("menu built in {:.2} ms", took.as_secs_f64() * 1000.0);
                 continue;
             }
             if m.e == "__stats" && crate::debug::enabled() {
@@ -1985,7 +2026,14 @@ impl App {
                 self.director.user(&self.sheet, if skid > 0 { "skid_stop_r" } else { "skid_stop_l" }, now);
             }
         }
-        self.refresh();
+        // Most ticks only move Clawd and step the pose, which `place_feet`
+        // has drawn. The rest of `refresh` (the tracker, the tick timer,
+        // strolls and hops, which wait while flying) is only needed when
+        // something else changed: a landing, coming to rest, a new pose.
+        // `TIMER_TICK` keeps running meanwhile and refreshes on its own.
+        if landing.is_some() || rest || self.director.current_name(now) != self.anim_name {
+            self.refresh();
+        }
     }
 
     fn on_mouse_leave(&mut self) {
@@ -2069,8 +2117,10 @@ impl App {
         }
         // Resolved now, so a window that can't be found is greyed out.
         let targets = self.tracker.goto_targets(now);
-        let finder = Finder::new();
-        self.goto_jumps = targets.iter().map(|t| Jump::find(&finder, t)).collect();
+        // A snapshot of every process (~15 ms) only when there's a host to
+        // look for.
+        let finder = targets.iter().any(|t| t.host.is_some()).then(Finder::new);
+        self.goto_jumps = targets.iter().map(|t| finder.as_ref().and_then(|f| Jump::find(f, t))).collect();
         let menu = unsafe {
             let menu = CreatePopupMenu();
             let item = |m: HMENU, flags: u32, id: usize, text: &str| {
@@ -2112,7 +2162,7 @@ impl App {
             item(menu, MF_POPUP, behaviours as usize, "Behaviours");
             item(menu, MF_STRING | checked(self.cfg.do_not_disturb), CMD_DO_NOT_DISTURB, "Do not disturb");
             item(menu, MF_SEPARATOR, 0, "");
-            let hooks = install::hook_status();
+            let hooks = install::hook_status_cached(&mut self.hook_status);
             item(menu, MF_STRING | checked(self.cfg.launch_with_claude), CMD_LAUNCH_WITH_CLAUDE, "Launch with Claude");
             item(menu, MF_STRING | checked(autostart::enabled()), CMD_START_WITH_WINDOWS, "Start with Windows");
             item(menu, MF_STRING | enabled(hooks.can_install), CMD_INSTALL_HOOKS, "Install Claude hooks");
@@ -2410,12 +2460,12 @@ fn show_menu(hwnd: HWND) {
 /// WinEvent callback (out-of-context, so it runs on this thread from the
 /// message loop). Only whole-window events count; a thread's child objects
 /// (buttons, carets…) report here too.
-unsafe extern "system" fn on_win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, object: i32, child: i32, _: u32, _: u32) {
+unsafe extern "system" fn on_win_event(hook: HWINEVENTHOOK, event: u32, hwnd: HWND, object: i32, child: i32, _: u32, _: u32) {
     let whole_window = object == OBJID_WINDOW && child == CHILDID_SELF as i32 && !hwnd.is_null();
     let handled = enter(|a| {
         a.stats.win_events += 1;
         if whole_window {
-            a.on_win_event(event, hwnd);
+            a.on_win_event(hook, event, hwnd);
         }
     });
     if handled.is_none() && whole_window {
@@ -2594,6 +2644,7 @@ pub fn run(opts: Options) {
             pulsing: false,
             attention: false,
             goto_jumps: Vec::new(),
+            hook_status: None,
             after: Vec::new(),
             host_check_at: None,
             claude_app: None,

@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 const EXE_NAME: &str = "clawd-pet.exe";
 
@@ -428,6 +429,7 @@ pub fn uninstall_hooks() -> Result<String, String> {
 }
 
 /// Which of the two tray items make sense right now.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HookStatus {
     pub can_install: bool,
     pub can_uninstall: bool,
@@ -442,6 +444,45 @@ pub fn hook_status() -> HookStatus {
     let out_of_date = merge(&mut root.clone(), &exe.to_string_lossy(), configured_port()).map_or(true, Merged::changed);
     let exe_is_stale = std::env::current_exe().is_ok_and(|me| differs(&me, &exe));
     HookStatus { can_install: out_of_date || exe_is_stale, can_uninstall: remove(&mut root.clone()) > 0 }
+}
+
+/// The files `hook_status` reads (the settings, both exes, the config for
+/// the port), each with its modification time and length.
+#[derive(PartialEq)]
+pub struct StatusKey(Vec<(Option<PathBuf>, Option<FileStamp>)>);
+
+/// When a file was last written, and its length.
+type FileStamp = (SystemTime, u64);
+
+impl StatusKey {
+    pub fn now() -> StatusKey {
+        let files = [settings_path(), installed_exe(), std::env::current_exe().ok(), crate::config::default_path()];
+        StatusKey(
+            files
+                .into_iter()
+                .map(|p| {
+                    let stamp = p.as_ref().and_then(|p| fs::metadata(p).ok()).and_then(|m| Some((m.modified().ok()?, m.len())));
+                    (p, stamp)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// `hook_status`, worked out again only when one of the files it reads has
+/// changed since the last answer in `cache`. Opening the menu otherwise
+/// re-read the settings and, for a pet not run from the installed copy,
+/// both exes, every time.
+pub fn hook_status_cached(cache: &mut Option<(StatusKey, HookStatus)>) -> HookStatus {
+    let key = StatusKey::now();
+    match cache {
+        Some((k, status)) if *k == key => *status,
+        _ => {
+            let status = hook_status();
+            *cache = Some((key, status));
+            status
+        }
+    }
 }
 
 #[cfg(test)]

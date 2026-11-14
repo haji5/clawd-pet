@@ -107,28 +107,35 @@ pub fn list(own: HWND) -> Vec<WindowInfo> {
 
 /// The same windows, with what's needed to find a session's host.
 pub fn top_windows() -> Vec<TopWindow> {
-    visible_handles()
-        .into_iter()
-        .map(|h| unsafe {
-            let mut pid = 0;
-            GetWindowThreadProcessId(h, &mut pid);
-            let r = bounds(h);
-            TopWindow {
-                id: h as usize,
-                pid,
-                owned: !GetWindow(h, GW_OWNER).is_null(),
-                tool: GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW != 0,
-                cloaked_by_app: cloak(h) & DWM_CLOAKED_APP != 0,
-                empty: IsIconic(h) == 0 && (r.r <= r.l || r.b <= r.t),
-            }
-        })
-        .collect()
+    visible_handles().into_iter().map(|h| top_window(h, pid_of(h))).collect()
+}
+
+fn pid_of(h: HWND) -> u32 {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(h, &mut pid) };
+    pid
+}
+
+/// The rest of a `TopWindow`, which costs two DWM reads.
+fn top_window(h: HWND, pid: u32) -> TopWindow {
+    unsafe {
+        let r = bounds(h);
+        TopWindow {
+            id: h as usize,
+            pid,
+            owned: !GetWindow(h, GW_OWNER).is_null(),
+            tool: GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW != 0,
+            cloaked_by_app: cloak(h) & DWM_CLOAKED_APP != 0,
+            empty: IsIconic(h) == 0 && (r.r <= r.l || r.b <= r.t),
+        }
+    }
 }
 
 /// Does that process have a window a person can see and use? Minimized
-/// counts; closed to the tray doesn't.
+/// counts; closed to the tray doesn't. Only that process's windows are
+/// read through DWM.
 pub fn has_app_window(pid: u32) -> bool {
-    top_windows().iter().any(|w| w.pid == pid && w.is_app_window())
+    visible_handles().into_iter().filter(|&h| pid_of(h) == pid).any(|h| top_window(h, pid).is_app_window())
 }
 
 pub fn exists(hwnd: HWND) -> bool {
