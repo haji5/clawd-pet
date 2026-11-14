@@ -1,6 +1,9 @@
 //! Tiny opt-in debug log: `--debug-log` writes to `%TEMP%\clawd-pet.log`.
 //! Off by default; when off, `dlog!` costs one relaxed atomic load.
 
+use std::fs::{File, OpenOptions};
+use std::io::{LineWriter, Write};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -13,12 +16,26 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// The log file, opened on the first line and kept open: opening and closing
+/// it for every line cost more than the event being logged (0.62–0.78 ms per
+/// event at 20 events/s against 0.21–0.37 ms without the log). A
+/// `LineWriter` hands each whole line to the file at once, so the measuring
+/// scripts can read it while the pet runs, and a crash leaves whole lines.
+static FILE: Mutex<Option<LineWriter<File>>> = Mutex::new(None);
+
 pub fn write(msg: std::fmt::Arguments) {
-    use std::io::Write;
-    let path = std::env::temp_dir().join("clawd-pet.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        let _ = f.write_all(format!("{}.{:03} {msg}\n", t.as_secs(), t.subsec_millis()).as_bytes());
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let line = format!("{}.{:03} {msg}\n", t.as_secs(), t.subsec_millis());
+    let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    if file.is_none() {
+        let path = std::env::temp_dir().join("clawd-pet.log");
+        *file = OpenOptions::new().create(true).append(true).open(path).ok().map(LineWriter::new);
+    }
+    if let Some(f) = file.as_mut()
+        && f.write_all(line.as_bytes()).is_err()
+    {
+        // Try opening it again on the next line.
+        *file = None;
     }
 }
 

@@ -383,7 +383,11 @@ public static class Perf {
         while (true) {
             double t = Qpc() - t0;
             if (t >= seconds) break;
-            if (t >= n * step) { foreach (var h in hwnds) Post(h, MOVE, 1, at(t)); n++; }
+            if (t >= n * step) {
+                // Take turns, so neither pet always gets its message first.
+                for (int k = 0; k < hwnds.Length; k++) Post(hwnds[n % 2 == 0 ? k : hwnds.Length - 1 - k], MOVE, 1, at(t));
+                n++;
+            }
             else if (n * step - t > 0.003) Thread.Sleep(1);
         }
         return n;
@@ -565,7 +569,12 @@ function Send([string]$e, [string]$tool, [hashtable]$more = @{}) {
     if ($tool) { $m.t = $tool }
     foreach ($k in $more.Keys) { $m[$k] = $more[$k] }
     $json = $m | ConvertTo-Json -Compress
-    foreach ($p in $script:sendPorts) { [Perf]::Udp($p, $json) }
+    # With -Against, whichever pet gets the datagram first wakes first, which
+    # read 16-20 % higher at 20 events/s. Take turns.
+    $ports = $script:sendPorts
+    $script:sendFlip = -not $script:sendFlip
+    if ($script:sendFlip -and $ports.Count -gt 1) { $ports = $ports[($ports.Count - 1)..0] }
+    foreach ($p in $ports) { [Perf]::Udp($p, $json) }
 }
 
 function Read-Stats([string]$dir, [switch]$AlreadyAsked) {
@@ -586,6 +595,7 @@ function Read-Stats([string]$dir, [switch]$AlreadyAsked) {
 }
 
 $script:sendPorts = @($Port)
+$script:sendFlip = $false
 $timerNames = @{ 1 = 'save'; 2 = 'tick'; 3 = 'art'; 4 = 'hold'; 5 = 'phys'; 6 = 'drag'; 7 = 'cursor'; 8 = 'ride'; 9 = 'fade'; 10 = 'walk'; 11 = 'pulse' }
 
 try {
