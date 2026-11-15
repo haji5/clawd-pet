@@ -35,7 +35,7 @@ use crate::install;
 use crate::interaction::{self, Click, Hand, Release, Swing};
 use crate::perch::{self, Fit, Foreground, Ride, RideEvent, Screen, WindowInfo};
 use crate::mood::{self, Clock, Mood};
-use crate::physics::{self, Floor, Sim, World};
+use crate::physics::{self, Floor, Sim, Stepper, World};
 use crate::ipc::{self, IpcMsg, Queue};
 use crate::placement;
 use crate::rng::Rng;
@@ -201,7 +201,8 @@ struct Flight {
     sim: Sim,
     world: World,
     last: Ms,
-    acc: f64,
+    /// Steps `sim` and says where to draw it, between steps.
+    stepper: Stepper,
     rot: u8,
     next_turn: Ms,
     shaken: bool,
@@ -1927,6 +1928,10 @@ impl App {
         }
         let (cx, cy) = self.cursor();
         let Some(rel) = self.hand.up(now, cx, cy) else { return };
+        if let (Release::Drop { vx, vy, .. }, Some((moves, ms))) = (&rel, self.hand.last_drag.take()) {
+            // How often this mouse reports: what `THROW_SAMPLE_MS` is tuned against.
+            crate::dlog!("drag ended: {moves} mouse moves in {ms} ms, thrown at ({:.0}, {:.0}) DIP/s", vx / self.hand.scale, vy / self.hand.scale);
+        }
         unsafe {
             KillTimer(self.hwnd, TIMER_HOLD);
             KillTimer(self.hwnd, TIMER_DRAG);
@@ -2014,7 +2019,8 @@ impl App {
 
     fn launch_as(&mut self, sim: Sim, world: World, shaken: bool, whoa: bool) {
         let now = self.now();
-        let f = Flight { sim, world, last: now, acc: 0.0, rot: 0, next_turn: now, shaken, whoa, knock: None, peak: 0.0, landed_at: None, skid: 0 };
+        let stepper = Stepper::new(&sim);
+        let f = Flight { sim, world, last: now, stepper, rot: 0, next_turn: now, shaken, whoa, knock: None, peak: 0.0, landed_at: None, skid: 0 };
         self.director.set_pose(f.pose(now), now);
         self.director.set_hover(false, now);
         self.set_motion(Motion::Flying(f));
@@ -2057,12 +2063,7 @@ impl App {
         };
         let dt = (now.saturating_sub(f.last)).min(50) as f64 / 1000.0;
         f.last = now;
-        f.acc += dt;
-        let mut events = Vec::new();
-        while f.acc >= feel::PHYS_DT {
-            events.extend(f.sim.step(&f.world, feel::PHYS_DT));
-            f.acc -= feel::PHYS_DT;
-        }
+        let (events, (x, y)) = f.stepper.advance(&mut f.sim, &f.world, dt);
         let s = f.world.scale;
         // Tumble in quarter turns when thrown fast, in the direction of travel.
         if f.sim.state == physics::State::Air {
@@ -2106,7 +2107,7 @@ impl App {
         if f.sim.state == physics::State::Slide && pose.is_some() {
             f.skid = if f.sim.vx >= 0.0 { 1 } else { -1 };
         }
-        let (x, y, rot) = (f.sim.x, f.sim.y, if f.sim.state == physics::State::Air { f.rot } else { 0 });
+        let rot = if f.sim.state == physics::State::Air { f.rot } else { 0 };
         if landing.is_some() {
             self.director.set_pose(None, now);
         }

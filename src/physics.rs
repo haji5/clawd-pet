@@ -302,6 +302,43 @@ pub fn edge_hang(x: f64, w: &World) -> Option<bool> {
     }
 }
 
+/// Runs a `Sim` in fixed steps from uneven real time, and says where to
+/// draw it: between the last two steps, by the time left over. The timer
+/// fires about every 15.6 ms and a step is 8.3, so a tick runs one step or
+/// two; drawn where the last step left it, Clawd would move half as far
+/// every eighth frame.
+pub struct Stepper {
+    acc: f64,
+    prev: (f64, f64),
+}
+
+impl Stepper {
+    pub fn new(sim: &Sim) -> Self {
+        Stepper { acc: 0.0, prev: (sim.x, sim.y) }
+    }
+
+    /// Advance by `dt` seconds of real time. Returns what happened and the
+    /// feet point to draw: exactly where the simulation is on a call with
+    /// an event (no frame with the feet a pixel into a title bar) and at
+    /// rest, else up to one step behind it, the same on every frame. The
+    /// simulation itself steps exactly as it would by hand.
+    pub fn advance(&mut self, sim: &mut Sim, world: &World, dt: f64) -> (Vec<Event>, (f64, f64)) {
+        self.acc += dt;
+        let mut events = Vec::new();
+        while self.acc >= PHYS_DT {
+            self.prev = (sim.x, sim.y);
+            events.extend(sim.step(world, PHYS_DT));
+            self.acc -= PHYS_DT;
+        }
+        if !events.is_empty() || sim.state == State::Rest {
+            return (events, (sim.x, sim.y));
+        }
+        let t = self.acc / PHYS_DT;
+        let (px, py) = self.prev;
+        (events, (px + (sim.x - px) * t, py + (sim.y - py) * t))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +365,73 @@ mod tests {
             }
         }
         all
+    }
+
+    /// What the window's timer gives: about 15.6 ms, sometimes 31.
+    const TICK: f64 = 0.015_6;
+
+    #[test]
+    fn a_flight_is_drawn_moving_evenly_between_steps() {
+        let w = world();
+        let mut s = Sim::hop(200.0, 100.0, 300.0, -500.0);
+        let mut stepper = Stepper::new(&s);
+        let mut last: Option<f64> = None;
+        let mut raw_moves = vec![];
+        while s.state == State::Air {
+            let before = s.x;
+            let (events, (x, _)) = stepper.advance(&mut s, &w, TICK);
+            if !events.is_empty() {
+                break;
+            }
+            raw_moves.push(((s.x - before) / (300.0 * PHYS_DT)).round() as i32);
+            if let Some(prev) = last {
+                assert!((x - prev - 300.0 * TICK).abs() < 1e-6, "{} vs {}", x - prev, 300.0 * TICK);
+            }
+            last = Some(x);
+        }
+        assert!(raw_moves.len() > 20, "long enough to see the pattern");
+        assert!(raw_moves.contains(&1) && raw_moves.contains(&2), "the simulation itself runs one step or two: {raw_moves:?}");
+    }
+
+    #[test]
+    fn on_a_bounce_or_landing_the_feet_are_drawn_on_the_floor() {
+        let w = world();
+        let mut s = Sim::launch(500.0, 300.0, 0.0, 0.0);
+        let mut stepper = Stepper::new(&s);
+        let mut touched = 0;
+        for i in 0..400 {
+            let (events, (x, y)) = stepper.advance(&mut s, &w, if i % 8 == 7 { 2.0 * TICK } else { TICK });
+            if events.iter().any(|e| matches!(e, Event::Bounce(_) | Event::Landed(_))) {
+                assert_eq!((x, y), (s.x, 800.0));
+                touched += 1;
+            }
+            if s.state == State::Rest {
+                assert_eq!((x, y), (s.x, s.y), "at rest: exactly where it is");
+                break;
+            }
+        }
+        assert!(touched >= 1);
+        assert_eq!(s.state, State::Rest);
+    }
+
+    #[test]
+    fn stepping_through_a_stepper_is_stepping_by_hand() {
+        let w = world();
+        let start = Sim::launch(300.0, 200.0, 1800.0, -900.0);
+        let (mut a, mut b) = (start.clone(), start);
+        let mut stepper = Stepper::new(&a);
+        let mut by_stepper = vec![];
+        let pieces = [TICK, TICK, 2.0 * TICK, 0.004, TICK, 0.011];
+        for i in 0..2000 {
+            by_stepper.extend(stepper.advance(&mut a, &w, pieces[i % pieces.len()]).0);
+            if a.state == State::Rest {
+                break;
+            }
+        }
+        let by_hand = run(&mut b, &w, 30.0);
+        assert_eq!(a.state, State::Rest);
+        assert_eq!(by_stepper, by_hand);
+        assert_eq!(a, b);
     }
 
     #[test]

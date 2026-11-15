@@ -41,6 +41,9 @@ struct Press {
     dragging: bool,
     holding: bool,
     shaken: bool,
+    /// While dragging: when it started and how many moves came since.
+    drag_t0: Ms,
+    moves: u32,
 }
 
 /// Counts direction reversals along one axis (the cursor shaking Clawd, or
@@ -82,14 +85,23 @@ impl Shake {
     }
 }
 
-/// The last few positions of something moving, for its velocity.
+/// The positions of something moving over the last `THROW_SAMPLE_MS`, for
+/// its velocity. Kept by time, not by count, so the velocity doesn't depend
+/// on how often the mouse (or a moving window) reports.
 #[derive(Default)]
 pub struct Trail(VecDeque<(Ms, f64, f64)>);
 
 impl Trail {
+    /// The newest position is always kept; older ones are at least
+    /// `TRAIL_GAP_MS` apart, and none older than the window.
     pub fn push(&mut self, now: Ms, x: f64, y: f64) {
-        self.0.push_back((now, x, y));
-        while self.0.len() > 8 {
+        let n = self.0.len();
+        if n >= 2 && self.0[n - 1].0.saturating_sub(self.0[n - 2].0) < TRAIL_GAP_MS {
+            self.0[n - 1] = (now, x, y);
+        } else {
+            self.0.push_back((now, x, y));
+        }
+        while self.0.len() > 1 && self.0.front().is_some_and(|s| now.saturating_sub(s.0) > THROW_SAMPLE_MS) {
             self.0.pop_front();
         }
     }
@@ -124,11 +136,14 @@ pub struct Hand {
     clicks: VecDeque<Ms>,
     trail: Trail,
     shake: Shake,
+    /// The last drag that ended: how many mouse moves over how many ms
+    /// (`--debug-log`: says how often this mouse reports).
+    pub last_drag: Option<(u32, Ms)>,
 }
 
 impl Hand {
     pub fn new(scale: f64) -> Self {
-        Hand { scale, press: None, clicks: VecDeque::new(), trail: Trail::default(), shake: Shake::default() }
+        Hand { scale, press: None, clicks: VecDeque::new(), trail: Trail::default(), shake: Shake::default(), last_drag: None }
     }
 
     pub fn pressed(&self) -> bool {
@@ -153,7 +168,7 @@ impl Hand {
     }
 
     pub fn down(&mut self, now: Ms, x: f64, y: f64) {
-        self.press = Some(Press { t0: now, x0: x, y0: y, dragging: false, holding: false, shaken: false });
+        self.press = Some(Press { t0: now, x0: x, y0: y, dragging: false, holding: false, shaken: false, drag_t0: now, moves: 0 });
         self.trail.clear();
         self.shake = Shake::default();
         self.trail.push(now, x, y);
@@ -168,10 +183,12 @@ impl Hand {
             }
             p.dragging = true;
             p.holding = false;
+            (p.drag_t0, p.moves) = (now, 0);
             self.trail.push(now, x, y);
             self.shake = Shake::at(x);
             return Event::DragStart;
         }
+        p.moves += 1;
         self.trail.push(now, x, y);
         let reversals = self.shake.track(now, x, SHAKE_MIN_DIP * self.scale, SHAKE_WINDOW_MS);
         let p = self.press.as_mut().unwrap();
@@ -201,6 +218,7 @@ impl Hand {
     pub fn up(&mut self, now: Ms, x: f64, y: f64) -> Option<Release> {
         let p = self.press.take()?;
         if p.dragging {
+            self.last_drag = Some((p.moves, now.saturating_sub(p.drag_t0)));
             self.trail.push(now, x, y);
             let (vx, vy) = self.velocity(now);
             return Some(Release::Drop { vx, vy, shaken: p.shaken });
@@ -400,6 +418,75 @@ mod tests {
         h.moved(2001, 10.0, 0.0);
         h.moved(2009, 500.0, 0.0);
         assert!(h.velocity(2009).0 <= THROW_MAX_DIP_S + 1e-6);
+    }
+
+    /// One gesture: 2000 px/s to the right until 96 ms, still for 12 ms,
+    /// released at 108 ms, the mouse reporting every `every` ms.
+    fn throw_sampled_every(every: Ms) -> f64 {
+        let mut h = Hand::new(1.0);
+        h.down(0, 0.0, 0.0);
+        let x = |t: Ms| 2.0 * t.min(96) as f64;
+        let mut t = every;
+        while t < 108 {
+            h.moved(t, x(t), 0.0);
+            t += every;
+        }
+        let Some(Release::Drop { vx, .. }) = h.up(108, x(108), 0.0) else { panic!() };
+        vx
+    }
+
+    #[test]
+    fn the_same_throw_on_any_mouse() {
+        // Worked out by hand for the time window: 1538, 1571, 1571. The old
+        // 8-sample trail gave 1600, 1000 and 667.
+        let (slow, fast, fastest) = (throw_sampled_every(8), throw_sampled_every(2), throw_sampled_every(1));
+        assert!((slow - 80.0 / 0.052).abs() < 1.0, "{slow}");
+        assert!((fast - 88.0 / 0.056).abs() < 1.0, "{fast}");
+        assert!((fastest - 88.0 / 0.056).abs() < 1.0, "{fastest}");
+        for v in [slow, fast] {
+            assert!((v - fastest).abs() / fastest < 0.05, "{slow} {fast} {fastest}");
+        }
+    }
+
+    #[test]
+    fn a_125_hz_mouse_throws_as_before() {
+        // Steady 8 ms reports, speeding up, released on the last report: the
+        // old trail kept the 8 newest samples, 56 ms from first to last.
+        let x = |t: Ms| (t * t) as f64 / 100.0;
+        let mut h = Hand::new(1.0);
+        h.down(0, 0.0, 0.0);
+        for i in 1..20 {
+            h.moved(i * 8, x(i * 8), 0.0);
+        }
+        let Some(Release::Drop { vx, .. }) = h.up(160, x(160), 0.0) else { panic!() };
+        let old = (x(160) - x(104)) / 0.056;
+        assert!((vx - old).abs() < 1e-9, "{vx} {old}");
+    }
+
+    #[test]
+    fn the_trail_stays_small_however_fast_the_mouse() {
+        let mut trail = Trail::default();
+        let bound = (THROW_SAMPLE_MS / TRAIL_GAP_MS + 2) as usize;
+        for t in 0..10_000 {
+            trail.push(t, t as f64, 0.0);
+            assert!(trail.0.len() <= bound, "{} at {t}", trail.0.len());
+        }
+        assert_eq!(trail.0.back().unwrap().0, 9_999, "the newest is kept");
+        let (vx, _) = trail.velocity(9_999, f64::MAX);
+        assert!((vx - 1000.0).abs() < 1e-6, "{vx}");
+    }
+
+    #[test]
+    fn a_drag_counts_its_mouse_moves() {
+        let mut h = Hand::new(1.0);
+        h.down(0, 0.0, 0.0);
+        h.moved(5, 1.0, 0.0); // under the threshold: no drag yet
+        h.moved(10, 50.0, 0.0); // starts the drag
+        for i in 1..=30 {
+            h.moved(10 + i, 50.0 + i as f64, 0.0);
+        }
+        h.up(45, 80.0, 0.0);
+        assert_eq!(h.last_drag, Some((30, 35)));
     }
 
     #[test]

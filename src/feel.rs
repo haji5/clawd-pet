@@ -31,8 +31,15 @@ pub const LEAN2_DIP_S: f64 = 900.0;
 pub const DRAG_TICK_MS: u32 = 33;
 
 // ---- throwing ----
-/// Throw velocity = cursor movement over this window before release.
-pub const THROW_SAMPLE_MS: Ms = 80;
+/// Throw velocity = cursor movement over this window before release, the
+/// same on any mouse: 56 ms is what the old 8-report trail gave a 125 Hz
+/// mouse (it gave a 1000 Hz one 7 ms).
+pub const THROW_SAMPLE_MS: Ms = 56;
+/// Positions closer together than this replace each other in the trail
+/// (`Trail::push`), so it holds at most `THROW_SAMPLE_MS / TRAIL_GAP_MS + 2`
+/// samples however fast the mouse reports. Small enough that the window's
+/// span is still measured to within a few ms.
+pub const TRAIL_GAP_MS: Ms = 4;
 /// Releases slower than this just drop.
 pub const THROW_MIN_DIP_S: f64 = 300.0;
 pub const THROW_MAX_DIP_S: f64 = 4500.0;
