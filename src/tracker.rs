@@ -496,10 +496,10 @@ impl Tracker {
         self.sessions.is_empty()
     }
 
-    /// Is a session stuck until the user answers? While one is, the window
-    /// checks now and then that its process is still there.
-    pub fn has_open_wait(&self) -> bool {
-        self.sessions.values().any(|s| s.attention.as_ref().is_some_and(Pending::blocks))
+    /// The Claude Code processes the sessions run in, a process once per
+    /// session it hosts. The window watches each one for its exit.
+    pub fn hosts(&self) -> impl Iterator<Item = Host> + '_ {
+        self.sessions.values().filter_map(|s| s.host)
     }
 
     /// Make room: the session that matters least goes (idle before working
@@ -889,17 +889,32 @@ mod tests {
     #[test]
     fn a_session_whose_process_is_gone_stops_calling() {
         let mut t = Tracker::new(0, 10);
-        assert!(!t.has_open_wait());
         open_prompt(&mut t, 0);
         t.set_host("a", Some(HOST));
-        t.on_event(&ev("Stop", "b"), 1_000); // "your turn" is no open wait
+        t.on_event(&ev("Stop", "b"), 1_000);
         t.on_event(&ev("UserPromptSubmit", "c"), 2_000); // no host known: kept
-        assert!(t.has_open_wait());
         assert_eq!(t.drop_dead(|h| h == HOST), 0, "still running");
         assert_eq!(mode(&mut t, 3 * 60 * MIN), IMPATIENT, "a prompt can wait for hours while its session lives");
         assert_eq!(t.drop_dead(|_| false), 1);
-        assert!(!t.has_open_wait());
         assert!(!t.tooltip().contains("needs permission"), "{}", t.tooltip());
+    }
+
+    #[test]
+    fn hosts_lists_the_known_processes_and_follows_drop_dead() {
+        let other = Host { pid: 43, created: 8 };
+        let mut t = Tracker::new(0, 10);
+        for id in ["a", "b", "c"] {
+            t.on_event(&ev("UserPromptSubmit", id), 0);
+        }
+        assert_eq!(t.hosts().count(), 0, "none known yet");
+        t.set_host("a", Some(HOST));
+        t.set_host("b", Some(HOST)); // `/clear` in the same process
+        t.set_host("c", Some(other));
+        let mut hosts: Vec<Host> = t.hosts().collect();
+        hosts.sort_by_key(|h| h.pid);
+        assert_eq!(hosts, [HOST, HOST, other]);
+        assert_eq!(t.drop_dead(|h| h != HOST), 2);
+        assert_eq!(t.hosts().collect::<Vec<_>>(), [other]);
     }
 
     #[test]

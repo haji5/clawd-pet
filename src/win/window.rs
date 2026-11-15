@@ -19,7 +19,7 @@ use super::foreground::{self, Hooks};
 use super::http;
 use super::launch;
 use super::monitor::{self, Monitor};
-use super::process::{self, Finder};
+use super::process::{self, ExitWatch, Finder, WM_APP_EXITED};
 use super::render::Surface;
 use super::tip::{self, Tip};
 use super::tray::{self, Tray, WM_APP_TRAY};
@@ -115,17 +115,10 @@ const APP_SETTLE_MS: u32 = 150;
 const TIMER_SWEEP: usize = 13;
 const SWEEP_RETRY_MS: u32 = 30_000;
 const SWEEP_TRIES: u8 = 3;
-/// With its window gone the app may be on its way out, and nothing says
-/// when a process ends: look again this often, this many times.
-const APP_RECHECK_MS: u32 = 2000;
-const APP_RECHECKS: u8 = 5;
 /// Far off every monitor, for `--offscreen`.
 const PARKED_AT: (i32, i32) = (-20000, -20000);
 /// How long hover outlives a mouse-leave.
 const HOVER_GRACE_MS: Ms = 300;
-/// While a session is stuck waiting for the user: how often to check that
-/// its Claude Code process still exists (nothing says when one dies).
-const HOST_CHECK_MS: Ms = 60_000;
 /// The tooltip over Clawd has room for every session; the tray's doesn't.
 const TIP_CHARS: usize = 600;
 /// Canvas row of the eyes (for the gaze direction).
@@ -257,7 +250,6 @@ struct ClaudeApp {
     host: Host,
     /// No window: closed to the tray (the process is still there).
     away: bool,
-    rechecks: u8,
     _hooks: Hooks,
 }
 
@@ -488,8 +480,9 @@ struct App {
     hook_status: Option<(install::StatusKey, install::HookStatus)>,
     /// For `enter` to run once the current handler has returned.
     after: Vec<After>,
-    /// While a session is stuck waiting: when to check its process next.
-    host_check_at: Option<Ms>,
+    /// One per process a session runs in, and the Claude app's: each posts
+    /// `WM_APP_EXITED` when its process ends (`host_for`, `drop_dead_sessions`).
+    watches: Vec<(Host, ExitWatch)>,
     claude_app: Option<ClaudeApp>,
     taskbar_created: u32,
     tracker: Tracker,
@@ -598,7 +591,7 @@ fn handle_later(msg: u32, wp: WPARAM, lp: LPARAM) {
     }
     let keep = match msg {
         // Their lParam is a plain number.
-        WM_APP_EVENT | WM_APP_RECHECK | WM_APP_TRAY | WM_APP_DISPLAY | WM_APP_UPDATE | WM_ENDSESSION | WM_DESTROY => (msg, wp, lp),
+        WM_APP_EVENT | WM_APP_RECHECK | WM_APP_TRAY | WM_APP_DISPLAY | WM_APP_UPDATE | WM_APP_EXITED | WM_ENDSESSION | WM_DESTROY => (msg, wp, lp),
         // Their lParam points at something that won't be there later, and
         // the handlers only read wParam.
         WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => (msg, wp, 0),
@@ -1392,7 +1385,8 @@ impl App {
             crate::dlog!("event {} s={} t={:?} n={:?} a={:?}", m.e, m.s, m.t, m.n, m.a);
             let reactions = self.tracker.on_event(&m, now);
             if let Some(pid) = m.pp {
-                self.tracker.set_host(&m.s, process::created(pid).map(|created| Host { pid, created }));
+                let host = self.host_for(pid);
+                self.tracker.set_host(&m.s, host);
                 if m.ds.is_some() {
                     self.watch_claude_app(pid);
                 }
@@ -1438,15 +1432,59 @@ impl App {
     }
 
     /// Forget sessions whose Claude Code process has gone without a
-    /// `SessionEnd` (a closed terminal, a crash): a prompt that was open
-    /// then would have Clawd call for the user, and pulse the tray, forever.
-    /// True if any went: the caller refreshes (unless it is the refresh).
+    /// `SessionEnd` (a closed terminal, a crash): a working session would
+    /// keep its pose for minutes, and a prompt that was open then would have
+    /// Clawd call for the user, and pulse the tray, forever. The one reaper:
+    /// `WM_APP_EXITED` calls it, and so does anything that is about to show
+    /// the sessions (a wake-up can be a moment behind). Free: one zero wait
+    /// per watch. True if any went: the caller refreshes.
     fn drop_dead_sessions(&mut self) -> bool {
-        let gone = self.tracker.drop_dead(|host| process::created(host.pid) == Some(host.created));
+        self.watches.retain(|(host, watch)| {
+            let ended = watch.ended();
+            if ended {
+                crate::dlog!("process {} ended", host.pid);
+            }
+            !ended
+        });
+        let watches = &self.watches;
+        let gone = self.tracker.drop_dead(|h| watches.iter().any(|(w, watch)| *w == h && !watch.ended()));
         if gone > 0 {
             crate::dlog!("{gone} session(s) dropped: their process is gone");
         }
         gone > 0
+    }
+
+    /// The host for a session's process (or the app's), watched from now on.
+    /// `None` if it can't be opened or has already exited. Lets go of the
+    /// watches nothing refers to any more first, so there are at most
+    /// `MAX_SESSIONS + 1`, one per process.
+    fn host_for(&mut self, pid: u32) -> Option<Host> {
+        let app = self.claude_app.as_ref().map(|c| c.host);
+        let used: Vec<Host> = self.tracker.hosts().chain(app).collect();
+        self.watches.retain(|(h, _)| used.contains(h));
+        if let Some((h, _)) = self.watches.iter().find(|(h, w)| h.pid == pid && !w.ended()) {
+            return Some(*h);
+        }
+        let (host, watch) = process::watch(pid, self.hwnd)?;
+        self.watches.push((host, watch));
+        Some(host)
+    }
+
+    /// Is `host` still running? Only a watched process can say yes.
+    fn alive(&self, host: Host) -> bool {
+        self.watches.iter().any(|(h, w)| *h == host && !w.ended())
+    }
+
+    /// A watched process has ended (or may have: the window asks each watch).
+    fn on_exited(&mut self) {
+        let app_ended = self.claude_app.as_ref().is_some_and(|c| !self.alive(c.host));
+        self.drop_dead_sessions();
+        if app_ended {
+            // Its sessions' processes go down with it, a few ms apart, in any
+            // order: judge once they have been reaped too.
+            self.check_claude_app_soon();
+        }
+        self.refresh();
     }
 
     // ---- the Claude desktop app ----
@@ -1458,29 +1496,27 @@ impl App {
         if !self.cfg.behaviours.follow_claude_app {
             return;
         }
-        if self.claude_app.as_ref().is_some_and(|c| process::created(c.host.pid) == Some(c.host.created)) {
+        if self.claude_app.as_ref().is_some_and(|c| self.alive(c.host)) {
             return;
         }
-        let Some(session) = process::created(session_pid).map(|created| Host { pid: session_pid, created }) else { return };
+        let Some(session) = self.host_for(session_pid) else { return };
         let Some(pid) = Finder::new().app_process(session) else { return };
-        let Some(created) = process::created(pid) else { return };
+        let Some(host) = self.host_for(pid) else { return };
         crate::dlog!("watching the Claude app, pid {pid}");
         let hooks = foreground::app(pid, Some(on_win_event));
-        self.claude_app = Some(ClaudeApp { host: Host { pid, created }, away: false, rechecks: 0, _hooks: hooks });
+        self.claude_app = Some(ClaudeApp { host, away: false, _hooks: hooks });
         self.check_claude_app();
     }
 
     fn check_claude_app_soon(&mut self) {
-        if let Some(c) = self.claude_app.as_mut() {
-            c.rechecks = APP_RECHECKS;
+        if self.claude_app.is_some() {
             unsafe { SetTimer(self.hwnd, TIMER_APP, APP_SETTLE_MS, None) };
         }
     }
 
     fn check_claude_app(&mut self) {
-        let Some(c) = self.claude_app.as_mut() else { return };
-        let pid = c.host.pid;
-        if process::created(pid) != Some(c.host.created) {
+        let Some(host) = self.claude_app.as_ref().map(|c| c.host) else { return };
+        if !self.alive(host) {
             crate::dlog!("the Claude app has quit");
             self.claude_app = None;
             self.drop_dead_sessions();
@@ -1493,13 +1529,10 @@ impl App {
             }
             return;
         }
-        let away = !windows::has_app_window(pid);
+        let away = !windows::has_app_window(host.pid);
+        let Some(c) = self.claude_app.as_mut() else { return };
         let changed = away != c.away;
         c.away = away;
-        if away && c.rechecks > 0 {
-            c.rechecks -= 1;
-            unsafe { SetTimer(self.hwnd, TIMER_APP, APP_RECHECK_MS, None) };
-        }
         if changed {
             crate::dlog!("the Claude app is {}", if away { "closed to the tray" } else { "open" });
             self.update_presence();
@@ -1654,14 +1687,6 @@ impl App {
         if self.perch().is_some_and(|p| !windows::exists(p.hwnd)) {
             self.fall_off("window is gone", None);
         }
-        // Nothing says when a session's process dies, so while one is stuck
-        // waiting for the user, look now and then.
-        if !self.tracker.has_open_wait() {
-            self.host_check_at = None;
-        } else if self.host_check_at.is_none_or(|t| now >= t) {
-            self.drop_dead_sessions();
-            self.host_check_at = Some(now + HOST_CHECK_MS);
-        }
         self.step_hop(now);
         let d = self.tracker.display(now);
         let d = if self.cfg.do_not_disturb { d.quiet() } else { d };
@@ -1698,7 +1723,6 @@ impl App {
             self.hover_off_at,
             self.hop.map(Hop::at),
             self.next_stroll,
-            self.host_check_at,
         ];
         match next.into_iter().flatten().min() {
             Some(at) => unsafe {
@@ -2601,6 +2625,7 @@ impl App {
             WM_APP_DISPLAY => self.set_display_off(wp == 0),
             WM_APP_EVENT => self.on_ipc(),
             WM_APP_UPDATE => self.on_update_news(),
+            WM_APP_EXITED => self.on_exited(),
             WM_APP_RECHECK => self.recheck_windows(),
             WM_TIMER if wp == TIMER_SAVE => self.save_now(),
             WM_TIMER if wp == TIMER_TICK => {
@@ -2896,7 +2921,7 @@ pub fn run(opts: Options) {
             goto_jumps: Vec::new(),
             hook_status: None,
             after: Vec::new(),
-            host_check_at: None,
+            watches: Vec::new(),
             claude_app: None,
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             tracker,
