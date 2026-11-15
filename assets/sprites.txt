@@ -43,20 +43,12 @@ KK
 KK
 ..
 
-// Droopy (sleepy): the lid halfway down.
-
-@frame eye_droopy anchor=1,0
-..
-..
-KK
-KK
-
 @frame eye_happy anchor=3,-1
 ..KK..
 .KKKK.
 KK..KK
 
-// Peacefully closed (asleep, stretching).
+// Peacefully closed (sleepy, yawning, asleep, stretching).
 
 @frame eye_closed anchor=3,-2
 KK..KK
@@ -2499,16 +2491,16 @@ WWWWW
 @step stretch eyes=normal
 @step stand eyes=normal hold=2
 
-@anim sleepy fps=1 loop eyes=droopy
+@anim sleepy fps=1 loop eyes=closed
 @step stand hold=3
 @step breathe hold=3
 
 @anim yawn fps=6 once eyes=closed
-@step stand eyes=droopy hold=2
+@step stand hold=2
 @step yawn_s
 @step yawn hold=5
 @step yawn_s
-@step stand eyes=droopy hold=2
+@step stand hold=2
 
 // Static (step 0 only) unless behaviours.animateWhileAsleep is on.
 @anim asleep fps=1 loop eyes=closed glyph=z
