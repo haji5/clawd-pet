@@ -184,6 +184,12 @@ pub fn load(path: &Path) -> Config {
 /// config as last loaded or saved) and `now`. So an edit made by hand
 /// while the pet runs isn't undone by its next save; it takes effect at
 /// the next start. Keys this version doesn't know are kept too.
+///
+/// Not flushed before the rename, on purpose (unlike `install::save`): this
+/// runs on the UI thread, up to once a second after a drag, where a flush
+/// can stall a frame, and a `config.json` cut short by a power cut heals
+/// itself (`load` moves a file that isn't a JSON object to `.bad` and uses
+/// the defaults).
 pub fn save(path: &Path, synced: &Config, now: &Config) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;

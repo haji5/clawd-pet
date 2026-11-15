@@ -2,7 +2,8 @@
 //! the hook entries in `~/.claude/settings.json`.
 //!
 //! `merge` and `remove` are pure; the file functions around them only ever
-//! replace a settings file that parsed, after backing it up.
+//! replace a settings file that parsed, after backing it up, with bytes that
+//! are on disk before the rename, and only if nobody changed it meanwhile.
 
 use serde_json::{Value, json};
 use std::fs;
@@ -180,7 +181,13 @@ fn write_backup(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
         let candidate = path.with_file_name(format!("{name}{BACKUP_MARK}{stamp}{suffix}"));
         match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
             Ok(mut f) => {
-                f.write_all(bytes)?;
+                // Flushed: a backup cut short reads as a blank file, which
+                // counts as `{}`, and uninstall could put that back.
+                if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+                    drop(f);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(e);
+                }
                 return Ok(candidate);
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
@@ -267,20 +274,68 @@ fn render(root: &Value, original: Option<&[u8]>) -> Result<Vec<u8>, serde_json::
     Ok(out)
 }
 
-/// Back up the old file, then replace it atomically.
-fn save(path: &Path, original: Option<&[u8]>, new: &[u8]) -> Result<Option<PathBuf>, String> {
-    let failed = |e: &dyn std::fmt::Display| format!("Could not write {}: {e}. It was left unchanged.", path.display());
-    let backup = original.map(|bytes| write_backup(path, bytes)).transpose().map_err(|e| failed(&e))?;
+/// Write `bytes` to `path` and have them on disk before returning. NTFS
+/// journals a rename but not a file's data: renamed into place unflushed, a
+/// power cut soon after can leave the new name pointing at zeros.
+fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Why `save` wrote nothing.
+#[derive(Debug, PartialEq)]
+enum SaveError {
+    /// The file no longer holds what the new content was made from (Claude
+    /// Code wrote it meanwhile, say): read it again and start over.
+    Changed,
+    /// Anything else, as the message for the user.
+    Failed(String),
+}
+
+impl From<String> for SaveError {
+    fn from(message: String) -> Self {
+        SaveError::Failed(message)
+    }
+}
+
+/// Replace the file at `path`, which held `original` (`None`: there was no
+/// file), with `new`: the new bytes are flushed to a temp file, the file is
+/// read again and must still be `original`, then the old bytes go to a
+/// backup and the temp file is renamed over it. Anything that fails or finds
+/// the file changed leaves no temp file and no backup behind.
+///
+/// The check narrows the window for a lost update from the whole
+/// read-merge-write (ms) to check-then-rename (µs). It can't close it:
+/// Windows has no compare-and-swap rename.
+fn save(path: &Path, original: Option<&[u8]>, new: &[u8]) -> Result<Option<PathBuf>, SaveError> {
+    let failed = |e: &dyn std::fmt::Display| SaveError::Failed(format!("Could not write {}: {e}. It was left unchanged.", path.display()));
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| failed(&e))?;
     }
     // Through a symlink (dotfile managers): replace the real file, not the link.
     let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let tmp = real.with_extension("json.clawd-tmp");
-    let written = fs::write(&tmp, new).and_then(|()| fs::rename(&tmp, &real));
-    if let Err(e) = written {
+    let give_up = |e: SaveError| {
         let _ = fs::remove_file(&tmp);
-        return Err(failed(&e));
+        e
+    };
+    write_synced(&tmp, new).map_err(|e| give_up(failed(&e)))?;
+    // What `path` reads as now (through the link, like `read_settings`).
+    let now = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => return Err(give_up(failed(&e))),
+    };
+    if now.as_deref() != original {
+        return Err(give_up(SaveError::Changed));
+    }
+    let backup = original.map(|bytes| write_backup(path, bytes)).transpose().map_err(|e| give_up(failed(&e)))?;
+    if let Err(e) = fs::rename(&tmp, &real) {
+        if let Some(b) = &backup {
+            let _ = fs::remove_file(b);
+        }
+        return Err(give_up(failed(&e)));
     }
     for old in backups(path).into_iter().skip(KEEP_BACKUPS) {
         let _ = fs::remove_file(old);
@@ -288,22 +343,45 @@ fn save(path: &Path, original: Option<&[u8]>, new: &[u8]) -> Result<Option<PathB
     Ok(backup)
 }
 
-fn install_into(path: &Path, exe: &str, port: Option<u16>) -> Result<(Merged, Option<PathBuf>), String> {
-    let existing = read_settings(path)?;
-    let (original, mut root) = match existing {
-        Some((bytes, root)) => (Some(bytes), root),
-        None => (None, json!({})),
-    };
-    let unchanged = |e: &dyn std::fmt::Display| format!("{}: {e}, so it was left unchanged.", path.display());
-    let merged = merge(&mut root, exe, port).map_err(|e| unchanged(&e))?;
-    if !merged.changed() {
-        return Ok((merged, None));
+/// How many times `install_into` / `uninstall_from` read, change and write
+/// the settings before giving up on a file that keeps changing under them.
+const SAVE_ATTEMPTS: usize = 3;
+
+/// Run `attempt` (read, change, `save`) again from the start while `save`
+/// finds the file changed, up to `SAVE_ATTEMPTS` times in all.
+fn retry_changed<T>(path: &Path, mut attempt: impl FnMut() -> Result<T, SaveError>) -> Result<T, String> {
+    for _ in 0..SAVE_ATTEMPTS {
+        match attempt() {
+            Ok(done) => return Ok(done),
+            Err(SaveError::Failed(message)) => return Err(message),
+            Err(SaveError::Changed) => {}
+        }
     }
-    let new = render(&root, original.as_deref()).map_err(|e| unchanged(&e))?;
-    Ok((merged, save(path, original.as_deref(), &new)?))
+    Err(format!("{} was being changed by another program, so nothing was written. Try again.", path.display()))
+}
+
+fn install_into(path: &Path, exe: &str, port: Option<u16>) -> Result<(Merged, Option<PathBuf>), String> {
+    retry_changed(path, || {
+        let existing = read_settings(path)?;
+        let (original, mut root) = match existing {
+            Some((bytes, root)) => (Some(bytes), root),
+            None => (None, json!({})),
+        };
+        let unchanged = |e: &dyn std::fmt::Display| format!("{}: {e}, so it was left unchanged.", path.display());
+        let merged = merge(&mut root, exe, port).map_err(|e| unchanged(&e))?;
+        if !merged.changed() {
+            return Ok((merged, None));
+        }
+        let new = render(&root, original.as_deref()).map_err(|e| unchanged(&e))?;
+        Ok((merged, save(path, original.as_deref(), &new)?))
+    })
 }
 
 fn uninstall_from(path: &Path) -> Result<(usize, Option<PathBuf>), String> {
+    retry_changed(path, || uninstall_once(path))
+}
+
+fn uninstall_once(path: &Path) -> Result<(usize, Option<PathBuf>), SaveError> {
     let Some((bytes, mut root)) = read_settings(path)? else { return Ok((0, None)) };
     let events = remove(&mut root);
     if events == 0 {
@@ -385,23 +463,18 @@ fn place_exe(from: &Path, to: &Path) -> io::Result<bool> {
     if !differs(from, to) {
         return Ok(false);
     }
-    let dir = to.parent().ok_or_else(|| io::Error::other("no install folder"))?;
-    fs::create_dir_all(dir)?;
-    let new = beside(to, "new");
-    if let Err(e) = fs::copy(from, &new) {
-        let _ = fs::remove_file(&new);
-        return Err(e);
-    }
-    swap_in(&new, to)?;
+    place_bytes(&fs::read(from)?, to)?;
     Ok(true)
 }
 
-/// Write `bytes` over the exe at `to` ("Check for updates"), the same way.
+/// Write `bytes` over the exe at `to` (`place_exe`, "Check for updates"):
+/// flushed to `<exe>.new` first, so the hook command never points at an exe
+/// that a power cut cut short, then `swap_in`.
 pub fn place_bytes(bytes: &[u8], to: &Path) -> io::Result<()> {
-    let dir = to.parent().ok_or_else(|| io::Error::other("no folder"))?;
+    let dir = to.parent().ok_or_else(|| io::Error::other("no install folder"))?;
     fs::create_dir_all(dir)?;
     let new = beside(to, "new");
-    if let Err(e) = fs::write(&new, bytes) {
+    if let Err(e) = write_synced(&new, bytes) {
         let _ = fs::remove_file(&new);
         return Err(e);
     }
@@ -910,6 +983,82 @@ mod tests {
         let second = write_backup(&path, b"two").unwrap();
         assert_ne!(first, second);
         assert_eq!(fs::read(first).unwrap(), b"one");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_changed_since_it_was_read_is_left_alone() {
+        let dir = temp_dir("changed");
+        let path = dir.join("settings.json");
+        fs::write(&path, b"{\"theirs\": 2}").unwrap();
+        assert_eq!(save(&path, Some(b"{\"theirs\": 1}"), b"{\"ours\": 1}"), Err(SaveError::Changed));
+        assert_eq!(fs::read(&path).unwrap(), b"{\"theirs\": 2}");
+        assert_eq!(files_in(&dir), ["settings.json"], "no temp file, no backup");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_appeared_since_it_was_read_is_left_alone() {
+        let dir = temp_dir("appeared");
+        let path = dir.join("settings.json");
+        fs::write(&path, b"{\"theirs\": 1}").unwrap();
+        assert_eq!(save(&path, None, b"{\"ours\": 1}"), Err(SaveError::Changed));
+        assert_eq!(fs::read(&path).unwrap(), b"{\"theirs\": 1}");
+        assert_eq!(files_in(&dir), ["settings.json"], "no temp file, no backup");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unchanged_file_is_replaced_with_a_backup() {
+        let dir = temp_dir("unchanged");
+        let path = dir.join("settings.json");
+        fs::write(&path, b"{}").unwrap();
+        let backup = save(&path, Some(b"{}"), b"{\"ours\": 1}").unwrap().expect("backed up");
+        assert_eq!(fs::read(&path).unwrap(), b"{\"ours\": 1}");
+        assert_eq!(fs::read(&backup).unwrap(), b"{}");
+        assert_eq!(files_in(&dir).len(), 2, "the file and its backup: {:?}", files_in(&dir));
+        let new = dir.join("new.json");
+        assert_eq!(save(&new, None, b"{}").unwrap(), None, "nothing to back up");
+        assert_eq!(fs::read(&new).unwrap(), b"{}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_change_meanwhile_is_retried_from_the_start_a_few_times() {
+        let path = Path::new("settings.json");
+        let mut calls = 0;
+        let done = retry_changed(path, || {
+            calls += 1;
+            if calls < SAVE_ATTEMPTS { Err(SaveError::Changed) } else { Ok(calls) }
+        });
+        assert_eq!(done, Ok(SAVE_ATTEMPTS));
+        calls = 0;
+        let err = retry_changed(path, || -> Result<(), _> {
+            calls += 1;
+            Err(SaveError::Changed)
+        })
+        .unwrap_err();
+        assert_eq!(calls, SAVE_ATTEMPTS);
+        assert!(err.contains("being changed by another program"), "{err}");
+        calls = 0;
+        let err = retry_changed(path, || -> Result<(), _> {
+            calls += 1;
+            Err(SaveError::Failed("disk full".into()))
+        });
+        assert_eq!((err, calls), (Err("disk full".into()), 1), "other failures aren't retried");
+    }
+
+    #[test]
+    fn copying_the_exe_and_writing_a_download_leave_the_same_bytes() {
+        let dir = temp_dir("same-bytes");
+        let from = dir.join("source.exe");
+        fs::write(&from, b"MZ the same either way").unwrap();
+        let (copied, written) = (dir.join("a").join(EXE_NAME), dir.join("b").join(EXE_NAME));
+        assert!(place_exe(&from, &copied).unwrap());
+        place_bytes(&fs::read(&from).unwrap(), &written).unwrap();
+        assert_eq!(fs::read(&copied).unwrap(), fs::read(&written).unwrap());
+        assert_eq!(files_in(&dir.join("a")), [EXE_NAME], "no .new");
+        assert_eq!(files_in(&dir.join("b")), [EXE_NAME], "no .new");
         fs::remove_dir_all(&dir).unwrap();
     }
 
